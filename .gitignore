@@ -1,0 +1,23 @@
+# Local research documentation and scripts excluded from this repository
+/docs/
+/scripts/turbulence/
+/scripts/resolution_scan/
+
+# Python and test/build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Simulation data, analysis caches, and generated outputs
+cache/
+run_status/
+*.nc
+*.npz
+*.pkl
+*.p
+*.log
+/scripts/*.png

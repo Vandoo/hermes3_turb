@@ -1,0 +1,10 @@
+numpy
+xarray
+xbout
+boutdata
+boututils
+netCDF4
+matplotlib
+scipy
+# optional: 3-D rendering in scripts/plot3d_filaments.py
+# pyvista
