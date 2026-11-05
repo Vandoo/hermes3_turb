@@ -40,6 +40,10 @@ restarts/ — tools that write restart or interpolated data files
   refine_restart.py          Refine/coarsen grids and produce restart files.
   rescale_plasma_restart.py  Rescale restart plasma density.
 
+grid_tools/ — prepare grid source and anomalous-transport fields
+  rebuild_src.py             Calibrate core and near-target plasma sources.
+  inject_anomalous.py        Write species D, chi, and nu coefficient profiles.
+
 Running a script
 ----------------
 Install the package or put the package checkout on PYTHONPATH. Run scripts
@@ -51,3 +55,48 @@ config_analysis.ini still read it from the current working directory; copy the
 shared template from scripts/config_analysis.ini there. Others use a CONFIG
 block or command-line arguments; see each script's header. Review case paths
 and settings before running.
+
+Preparing grid sources and anomalous diffusivities
+-------------------------------------------------
+Install the package first (python3 -m pip install -e .). These tools require
+explicit, different input/output grid paths and preserve unrelated grid fields.
+Existing output files require --overwrite; input grids are never edited.
+
+Build sources on a guardless double-null grid:
+  python scripts/grid_tools/rebuild_src.py --in grid.nc --out grid_src.nc \
+    --mode cd --flux 1e22 --heating 300e3 --target-frac 0.02 --T-inj 5
+
+--flux is the integrated particle input on the core poloidal rows [s^-1].
+--mode cd sets the fraction of total particle input on non-core rows;
+--mode sxd makes that contribution zero. These are source configurations,
+not restrictions to one magnetic geometry. --heating is total power per
+species [W], so the example gives 600 kW for electrons plus ions. The core
+pressure source is adjusted to include the near-target injection energy
+within that total. --T-inj is the target injection temperature [eV].
+--match existing_src.nc reproduces that grid's core-row particle input and
+total e+i heating instead of --flux/--heating. Matching requires the same
+grid dimensions and topology. The calibration uses MXG=2 and no y guards;
+guarded or single-null input grids are rejected by this driver.
+
+Outputs: Ne_src [m^-3 s^-1], Pe_src=Pi_src [Pa s^-1]. Energy input is
+3/2 times the pressure-source volume integral. Hermes-3 reads these fields
+from the grid; leave the corresponding source expressions unset in BOUT.inp
+and use source_only_in_core=false when retaining near-target sources.
+The reusable profile class is available as:
+  from hermes3_turb.plasma_source_reader import PlasmaSourceReader
+
+Add anomalous transport profiles, selecting the actual species labels:
+  python scripts/grid_tools/inject_anomalous.py \
+    --in grid_src.nc --out grid_src_diff.nc --species e i \
+    --D 4 --chi 4 --chi-core 10 --nu 2 --nu-pfr 0
+
+All coefficients are physical m^2/s; Hermes-3 normalizes them internally.
+D_<species> is uniform; chi_<species> uses --chi-core inside the inner
+separatrix on closed poloidal bands and --chi elsewhere. nu_<species> uses
+--nu-pfr inside that separatrix on private-flux bands and --nu elsewhere.
+Core/PFR selection accounts for single-/double-null topology and grid y
+guards. D and chi are Field2D; nu is Field3D, repeated across every z plane
+(a singleton z dimension is added if absent). dv stores 2*pi*J*dx*dy [m^3].
+Existing fields are updated. Species anomalous_D, anomalous_chi and
+anomalous_nu input options override grid fields; leave them unset to use
+these profiles. The applicable anomalous_diffusion component must be enabled.
