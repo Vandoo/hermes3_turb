@@ -46,12 +46,12 @@ from scipy.optimize import curve_fit
 
 from .geometry import poloidal_area_element_dx
 from .decompose import toroidal_mean
-from .load import detect_toroidal_dim, detect_poloidal_dim, _no_t
+from .load import detect_toroidal_dim, detect_poloidal_dim, _no_t, to_field_aligned
 
 
 # Physical constants
-_e  = 1.602e-19   # elementary charge [C]
-_mp = 1.673e-27   # proton mass [kg]
+_e  = 1.602176634e-19   # elementary charge [C]
+_mp = 1.67262192369e-27   # proton mass [kg]
 _me = 9.109e-31   # electron mass [kg]
 
 
@@ -209,10 +209,188 @@ def _field_line_incidence(ds, pdim, y_idx):
 # Heat flux density at a target
 # ---------------------------------------------------------------------------
 
+def _shifted_storage(ds):
+    """True when fields are stored non-aligned and need a zShift shift.
+
+    Only ``[mesh:paralleltransform] type = shifted`` stores data that way. An
+    ``identity`` run already stores aligned data (shifting it again would
+    corrupt it silently), and an FCI run has no zShift. Without archived
+    options, fall back to the presence of zShift."""
+    if "zShift" not in ds:
+        return False
+    options = ds.attrs.get("options") or {}
+    try:
+        section = (options["mesh:paralleltransform"]
+                   if "mesh:paralleltransform" in options else
+                   options["mesh"]["paralleltransform"])
+        kind = str(section["type"]).strip().strip('"\'').lower()
+    except (KeyError, TypeError):
+        return True
+    if kind in ("identity", "fci"):
+        return False
+    if kind == "shifted":
+        return True
+    raise ValueError(f"Target FFT alignment does not implement transform {kind!r}; "
+                     "pass already aligned fields with align_fields=False.")
+
+
+def _target_row(ds, da, row, align=True, direction=1):
+    """Read just one sheath row, optionally shifting to/from field alignment."""
+    pdim = detect_poloidal_dim(ds)
+    selected = da.isel({pdim: [row]})
+    if align and _shifted_storage(ds):
+        selected = to_field_aligned(
+            selected, ds.isel({pdim: [row]}), direction=direction)
+    return selected.isel({pdim: 0}, drop=True)
+
+
+def _replace_target_rows(ds, field, replacements):
+    """Replace boundary planes without loading the rest of a lazy field."""
+    pdim = detect_poloidal_dim(ds)
+    had_coordinate = pdim in field.coords
+    if not had_coordinate:
+        field = field.assign_coords({pdim: np.arange(field.sizes[pdim])})
+    pieces, start = [], 0
+    for index, plane in sorted(replacements.items()):
+        if index > start:
+            pieces.append(field.isel({pdim: slice(start, index)}))
+        label = ds[pdim].values[index] if pdim in ds.coords else index
+        pieces.append(plane.expand_dims({pdim: [label]}).transpose(*field.dims))
+        start = index + 1
+    if start < field.sizes[pdim]:
+        pieces.append(field.isel({pdim: slice(start, None)}))
+    result = xr.concat(pieces, dim=pdim, coords="minimal", compat="override")
+    if not had_coordinate:
+        result = result.drop_vars(pdim)
+    result.attrs = field.attrs.copy()
+    return result
+
+
+def recover_target_ion_velocity(ds, ion_species="i", AA_ion=2.0, Z_ion=1.0,
+                                density_floor=None, ion_adiabatic=None,
+                                align_fields=True):
+    """Recover missing Vi for the full, single-ion Hermes sheath model.
+
+    Inputs are SI, as returned by xhermes with unnormalise=True. Use this
+    BEFORE averaging/concatenating snapshots. Interior momentum determines
+    interior velocity; the full sheath rule determines the four target guard
+    planes, including supersonic outflow. Momentum guard values are never used.
+    Missing Ti is derived inside the plasma and extrapolated with limitFree.
+
+    Validated for sheath_boundary, sin_alpha=1, a single positive ion, and
+    shifted or identity transforms. sheath_boundary_simple is a different
+    model and needs saved Vi. density_floor and adiabatic come from archived
+    dataset options, or the Hermes defaults (1e-7 and 5/3); callers can override.
+    """
+    if f"V{ion_species}" in ds:
+        return ds
+    from fractions import Fraction
+
+    options = ds.attrs.get("options") or {}
+    ion_options = options[ion_species] if ion_species in options else {}
+    hermes = options["hermes"] if "hermes" in options else {}
+    if "sheath_boundary_simple" in str(hermes["components"] if "components" in hermes else ""):
+        raise ValueError("Missing Vi reconstruction requires sheath_boundary; "
+                         "save Vi for sheath_boundary_simple.")
+    sheath = options["sheath_boundary"] if "sheath_boundary" in options else {}
+    smoothing = sheath["bohm_smoothing"] if "bohm_smoothing" in sheath else 0
+    if float(smoothing) > 0:
+        raise ValueError("Missing Vi reconstruction assumes the max(C_i, V) sheath "
+                         f"velocity; this run has bohm_smoothing={smoothing}. "
+                         "Save Vi ([i] diagnose = true).")
+    if AA_ion <= 0 or Z_ion <= 0:
+        raise ValueError("Sheath reconstruction requires a positive ion mass/charge")
+    def number(value):
+        return float(Fraction(str(value).replace(" ", "")))
+    floor = number(density_floor if density_floor is not None else
+                   (ion_options["density_floor"] if "density_floor" in ion_options else 1e-7))
+    adiabatic = number(ion_adiabatic if ion_adiabatic is not None else
+                       (ion_options["adiabatic"] if "adiabatic" in ion_options else 5. / 3))
+    meta = ds.metadata
+    scales = {key: float(meta.get(key, 0)) for key in ("Nnorm", "Tnorm", "Cs0")}
+    if (not np.isfinite(floor) or floor <= 0 or not np.isfinite(adiabatic)
+            or adiabatic <= 0
+            or not all(np.isfinite(v) and v > 0 for v in scales.values())):
+        raise ValueError("Sheath reconstruction needs positive density_floor, "
+                         "Nnorm, Tnorm and Cs0 metadata")
+    nscale, tscale, cs = (scales[k] for k in ("Nnorm", "Tnorm", "Cs0"))
+    boundaries, guards = get_target_boundaries(ds)
+    ny = int(meta.get("ny", 0))
+    inner = int(meta.get("ny_inner", 0))
+    expected = ny + (4 if 0 < inner < ny else 2) * int(meta.get("MYG", 0))
+    if not guards or ds.sizes[detect_poloidal_dim(ds)] != expected:
+        raise ValueError("Sheath reconstruction requires guards at every target; "
+                         "re-squash with --force-guard-cells")
+    density, momentum = ds[f"N{ion_species}"], ds[f"NV{ion_species}"]
+    if any(a.attrs.get("units_type", "SI") != "SI" for a in (density, momentum)):
+        raise ValueError("Sheath reconstruction expects SI fields (unnormalise=True)")
+    mp = float(momentum.attrs.get("conversion", _mp * nscale * cs)) / (nscale * cs)
+    if not np.isfinite(mp) or mp <= 0:
+        raise ValueError("Invalid ion momentum conversion for sheath reconstruction")
+    n = (density / nscale).clip(min=0)
+    nlim = n + floor * np.exp(-n / floor)
+    velocity = momentum / (AA_ion * mp * nscale * nlim)
+    velocity.attrs = {"units_type": "SI", "units": "m/s", "conversion": cs,
+                      "source": "reconstructed_full_sheath"}
+    result = ds.copy()
+    temperature_missing = f"T{ion_species}" not in ds
+    temperature = (ds[f"P{ion_species}"] / (_e * density)
+                   if temperature_missing else ds[f"T{ion_species}"])
+    if temperature_missing:
+        temperature.attrs = {"units_type": "SI", "units": "eV", "conversion": tscale}
+    vi_guards, ti_guards = {}, {}
+    def row(field, index):
+        return _target_row(ds, field, index, align=align_fields)
+
+    def free(fm, fc):
+        return xr.where((fm < fc) | (fm < 1e-10), fc,
+                        fc**2 / fm.clip(min=1e-300))
+    pdim = detect_poloidal_dim(ds)
+    for domain, guard in boundaries.values():
+        sign = -1 if guard < domain else 1
+        neighbour = domain - sign
+        ni = row(n, domain)
+        ni_face = .5 * (ni + free(row(n, neighbour), ni))
+        ne_field = (ds["Ne"] / nscale).clip(min=0)
+        ne = row(ne_field, domain)
+        ne_face = .5 * (ne + free(row(ne_field, neighbour), ne))
+        te = row(ds["Te"], domain) / tscale
+        te_face = .5 * (te + free(row(ds["Te"], neighbour) / tscale, te))
+        ti = row(temperature, domain) / tscale
+        ti_guard = free(row(temperature, neighbour) / tscale, ti)
+        ti_face = (.5 * (ti + ti_guard)).clip(min=1e-5)
+        dne, dni = ne - ne_face, ni - ni_face
+        ratio = xr.where(abs(dni) < 1e-3, 1., dne / xr.where(abs(dni) < 1e-3, 1., dni))
+        concentration = (ni_face / ne_face.clip(min=1e-10)).clip(min=0, max=1)
+        sound2 = ((adiabatic * ti_face + Z_ion * concentration * te_face * ratio)
+                  / AA_ion).clip(min=0, max=100)
+        v_domain = row(velocity, domain)
+        v_face = sign * np.maximum(cs * np.sqrt(sound2), sign * v_domain)
+        v_guard = 2 * v_face - v_domain
+        # Store the guard in the ORIGINAL shifted coordinates. The heat-flux
+        # routine aligns it once, together with the other sheath fields.
+        label = ds[pdim].values[guard] if pdim in ds.coords else guard
+        guard_plane = v_guard.expand_dims({pdim: [label]})
+        if align_fields and _shifted_storage(ds):
+            guard_plane = to_field_aligned(
+                guard_plane, ds.isel({pdim: [guard]}), direction=-1)
+        vi_guards[guard] = guard_plane.isel({pdim: 0}, drop=True)
+        if temperature_missing:
+            guard_plane = (ti_guard * tscale).expand_dims({pdim: [label]})
+            if align_fields and _shifted_storage(ds):
+                guard_plane = to_field_aligned(
+                    guard_plane, ds.isel({pdim: [guard]}), direction=-1)
+            ti_guards[guard] = guard_plane.isel({pdim: 0}, drop=True)
+    result[f"V{ion_species}"] = _replace_target_rows(ds, velocity, vi_guards)
+    if temperature_missing:
+        result[f"T{ion_species}"] = _replace_target_rows(ds, temperature, ti_guards)
+    return result
+
+
 def target_heat_flux_density(
     ds,
     Pe, Pi,
-    Ve, Vi,
+    Ve, Vi=None,
     phi=None,
     target="outer_lower",
     phi_wall=0.0,
@@ -221,6 +399,8 @@ def target_heat_flux_density(
     zdim=None,
     bohm_cap_v=True,
     sheath_ion_polytropic=1.0,
+    ion_species="i",
+    align_fields=True,
 ):
     """
     Compute heat flux density at a named divertor target [W/m²].
@@ -232,14 +412,10 @@ def target_heat_flux_density(
 
     where γ_e = 2 + max(φ−φ_wall,0)/T_e and γ_i = 2.5 + m_i v_{∥i}²/(2 e T_i).
 
-    This is the **total** wall deposition (matches an IR thermography of the
-    target). It also equals what ``sheath_boundary.cxx`` deposits: line 364
-    adds an *additional* sink ((γ_s − 5/2)·T_s − ½ m_s C²) n v on top of the
-    bulk advection scheme's natural (5/2) P V carry through the boundary face,
-    summing to γ·P·V minus a negligible electron-mass term. Hermes-3's
-    ``ef*_tot_ylow`` diagnostic only captures the advection+conduction part of
-    this — at the sheath face it sits below γ·P·V by the sheath sink term and
-    by the ion kinetic carry (which is in the momentum equation).
+    This evaluates the conventional gamma*P*|V| sheath-boundary power.
+    It is not a complete discrete energy balance: the native ef*_tot_ylow
+    includes a numerical-viscosity flow component, and electrical boundary
+    work must be accounted for separately when comparing total wall power.
 
     Plasma profiles (Pe, Pi, Ve, Vi, phi, Te, Ti, Ne, Ni) are interpolated onto
     the target plate using the y-boundary guard cells (see get_target_boundaries).
@@ -252,7 +428,9 @@ def target_heat_flux_density(
     Pe   : xarray.DataArray  electron pressure [Pa]  (full 3D, with y-guards)
     Pi   : xarray.DataArray  ion pressure      [Pa]
     Ve   : xarray.DataArray  electron parallel velocity [m/s]
-    Vi   : xarray.DataArray  ion parallel velocity     [m/s]
+    Vi   : xarray.DataArray, optional, ion velocity [m/s]
+        If None, reconstruct the full sheath from interior momentum before
+        face averaging. Never pass NV/N evaluated in momentum guard cells.
     phi  : xarray.DataArray, optional  electrostatic potential [V]
     target : str  one of the keys from get_target_y_indices()
     phi_wall : float  wall potential [V], default 0
@@ -263,7 +441,7 @@ def target_heat_flux_density(
         DEPRECATED. Originally intended to cap |V_∥| ≤ c_s at the sheath face,
         but that's the wrong direction — Hermes-3's ``sheath_boundary_simple``
         enforces |V_∥| ≥ c_s as a FLOOR (supersonic interior flow is preserved),
-        and the full ``sheath_boundary`` sets V = ±c_s exactly. A cap would
+        and the full ``sheath_boundary`` also preserves supersonic outflow. A cap would
         clip legitimate supersonic flow. The kwarg is kept for API compatibility
         but is a no-op; True only emits a DeprecationWarning. Use the M_∥
         diagnostic in target_poloidal_check.py to interpret apparent M > 1
@@ -272,13 +450,23 @@ def target_heat_flux_density(
     sheath_ion_polytropic : float, default 1.0
         Kept for API compatibility; no longer used (only entered the removed
         c_s² formula for the cap).
+    ion_species : str, default "i"
+        Ion label for missing-Vi reconstruction.
+    align_fields : bool, default True
+        Align shifted rows before averaging. Set False for fields that the
+        caller has already aligned. Only the required rows are loaded.
 
     Returns
     -------
     q_local : xarray.DataArray (x, zeta)  heat flux density at target [W/m²]
+        In field-aligned toroidal coordinates when align_fields=True.
     q_avg   : xarray.DataArray (x,)       toroidal-mean heat flux [W/m²]
     y_idx   : int  poloidal index of the target slice used
     """
+    if Vi is None:
+        ds = recover_target_ion_velocity(
+            ds, ion_species, AA_ion, Z_ion, align_fields=align_fields)
+        Vi = ds[f"V{ion_species}"]
     if zdim is None:
         zdim = detect_toroidal_dim(ds)
     pdim = detect_poloidal_dim(ds)
@@ -291,7 +479,8 @@ def target_heat_flux_density(
     # interpolation. This requires the guard cells (Hermes-3's extrapolated
     # values); without them this collapses to the last domain-cell value.
     def at_sheath(da):
-        return 0.5 * (da.isel({pdim: i_dom}) + da.isel({pdim: i_gc}))
+        return 0.5 * (_target_row(ds, da, i_dom, align_fields)
+                      + _target_row(ds, da, i_gc, align_fields))
 
     Pe_t  = at_sheath(Pe)
     Pi_t  = at_sheath(Pi)
@@ -327,7 +516,7 @@ def target_heat_flux_density(
 
     # NOTE: No Bohm cap on Vi_t / Ve_t. Hermes-3's `sheath_boundary_simple`
     # imposes |V_∥| ≥ c_s as a FLOOR (a min/max in cxx; supersonic interior
-    # flow is preserved). The full `sheath_boundary` sets V = ±c_s exactly.
+    # flow is preserved). The full `sheath_boundary` preserves supersonic flow too.
     # In both cases a CAP at c_s would be wrong-direction — it would clip
     # legitimate supersonic flow. Apparent M > 1 in time-averaged ⟨NV⟩/⟨N⟩
     # is either physical (sheath_boundary_simple with supersonic interior)
@@ -360,13 +549,6 @@ def target_heat_flux_density(
         gamma_i = 3.5
 
     # Parallel heat flux at sheath: q_{∥,s} = γ_s · P_s · |v_{∥s}|
-    # This IS the total wall deposition. sheath_boundary.cxx (line 364) adds an
-    # "additional" q = ((γ − 5/2)·T − ½ m C²)·n·v on top of the natural
-    # advection (5/2) P V the bulk advection scheme already carries, so the net
-    # is (5/2) P V + (γ − 5/2) P V = γ P V (− tiny m_e n V³ for electrons).
-    # ef*_tot_ylow shows only the advection + conduction part, so it sits a
-    # bit below γ P V at the sheath face by the missing electron-sheath
-    # contribution and the ion kinetic carry.
     q_par_e = gamma_e * Pe_t * np.abs(Ve_t)   # [W/m²]
     q_par_i = gamma_i * Pi_t * np.abs(Vi_t)   # [W/m²]
 

@@ -13,6 +13,11 @@ Scripts that load Hermes-3 data also require xhermes. The reusable package
 provides analysis functions; use xhermes, xbout, or boutdata directly for
 loading. Start with scripts/README.txt for the script catalogue.
 
+Target heat flux scripts require saved Ve ([e] diagnose=true). Missing Vi/Ti
+is supported through the validated full-sheath reconstruction before averaging;
+retain all target guard cells and use the updated target.py with the scripts.
+The target cache version is algn_recVi_Ve_fxv10; older caches are recomputed.
+
 Scripts are grouped into fluxes/, balances/, targets/, geometry/,
 run_diagnostics/, restarts/, and grid_tools/. Most use a CONFIG block; some use
 command-line arguments or config_analysis.ini in the current working directory. Read each

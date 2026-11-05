@@ -52,6 +52,7 @@ from hermes3_turb.target import (
     get_target_boundaries,
     field_line_incidence,
     target_heat_flux_density,
+    recover_target_ion_velocity,
     total_target_power,
 )
 
@@ -116,6 +117,18 @@ if not has_guards:
     print("WARNING: no y-boundary guard cells — plate interpolation falls back "
           "to the last domain cell.")
 
+if "Ve" not in ds:
+    # The sheath sets the electron guard velocity too; NVe/Ne evaluated in
+    # that guard does not generally recover the imposed sheath velocity.
+    raise SystemExit("Ve is not in the dump: the electron sheath power "
+                     "cannot be taken from NVe/Ne in the guard cells. Save Ve "
+                     "([e] diagnose = true) and re-run.")
+
+# Missing Vi: rebuild the sheath guard from interior momentum BEFORE averaging
+# (NVi/Ni in momentum guards is not the sheath velocity; see docs/target.md).
+if f"V{ion_species}" not in ds:
+    print(f"  V{ion_species} absent: reconstructing the full sheath from interior momentum")
+    ds = recover_target_ion_velocity(ds, ion_species, AA_ion)
 # Time-average over all loaded frames (assumed saturated; pre-trim before squashing)
 print(f"Averaging over all {ds.sizes['t']} loaded frame(s)")
 dsa = ds.mean("t")

@@ -33,14 +33,17 @@ CONFIG block.
 """
 
 import os
+import warnings
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 from xhermes import open_hermesdataset
 
 import hermes3_turb as h3t
+from hermes3_turb.profile_time import profile_times, time_label
 from hermes3_turb.load import _no_t, get_parallel_velocity
 from hermes3_turb.target import (
+    recover_target_ion_velocity,
     get_target_y_indices,
     get_target_boundaries,
     get_midplane_y_indices,
@@ -93,6 +96,7 @@ target_band  = True                # shade ±1σ on the target profiles, σ over
                                    # TIME of the per-snapshot q (same convention
                                    # as the OMP band in v3_radial_flux.py)
 target_band_n = 1.0                # band half-width in units of σ
+time_label_mode = "span"           # "span": Δt in ms; "range": start–end in ms
 target_mean = "per_snapshot"       # "per_snapshot" = plot ⟨q(P,V)⟩_t, the mean of
                                    #   the per-frame heat fluxes — correct, and the
                                    #   centre of the band.
@@ -118,6 +122,46 @@ dir_range = h3t.existing_dirs(data_root, dir_range, ("boutdata_guards.nc", "bout
                                                      "boutdata.nc", "BOUT.dmp.*.nc"))
 
 
+def _expected_guard_rows(m):
+    """Poloidal size of a squash that keeps the y-guards at EVERY target:
+    ny + 2·MYG (single null) or ny + 4·MYG (double null, include_upper).
+    get_target_boundaries assumes this layout (DN upper split at
+    ny_inner + 2·MYG), so a plain yguards=True DN squash (ny + 2·MYG,
+    lower targets only) would mis-index both upper targets silently."""
+    ny, myg = m.get("ny"), int(m.get("MYG", 2))
+    if ny is None:
+        return None
+    ny_inner = m.get("ny_inner")
+    is_dn = ny_inner is not None and 0 < int(ny_inner) < int(ny)
+    return int(ny) + 2 * myg * (2 if is_dn else 1)
+
+
+def _report_guard_status(has_guards, ny_loaded=None, ny_domain=None,
+                         ny_expected=None, cached=False):
+    """Stop without the y-guards at every target (q_t would be taken half a
+    cell upstream of the plate); warn for a cache that predates the check."""
+    if has_guards is None:
+        warnings.warn(
+            "Target cache has no y-boundary guard status: plate heat flux is "
+            "UNVERIFIED. Re-squashing does not refresh this cache. Set "
+            "use_cache=False and recompute from guard-retaining dumps.",
+            stacklevel=2)
+        return
+    if not has_guards or (ny_expected is not None and ny_loaded != ny_expected):
+        raise SystemExit(
+            "Cannot calculate plate heat flux: y-boundary guards missing at some "
+            f"or all targets (loaded y={ny_loaded}, metadata ny={ny_domain}, "
+            f"expected {ny_expected} with guards at every target). Re-squash "
+            "every selected numbered folder with "
+            "`squash_folder.sh --force-guard-cells` (writes boutdata_guards.nc "
+            "with yguards='include_upper'), then set use_cache=False. "
+            "keep_yboundaries=True cannot restore cells absent from the file.")
+    origin = "recorded when cache was computed" if cached else "detected in loaded data"
+    print(f"Y-boundary guards PRESENT ({origin}): loaded y={ny_loaded}, "
+          f"domain ny={ny_domain}. Profiles interpolate to the target plate. "
+          "Guard retention alone does not validate the sheath model or fits.")
+
+
 def _compute():
     """Load + concatenate dumps, evaluate target heat flux per target, return
     a flat dict for pickling."""
@@ -128,13 +172,23 @@ def _compute():
                                      os.path.join(folder, "boutdata_yguards.nc"),
                                      os.path.join(folder, "boutdata.nc"))
                          if os.path.exists(c)), os.path.join(folder, "BOUT.dmp.*.nc"))
-        settings = next((s for s in (os.path.join(data_root, "BOUT.settings"),
-                                     os.path.join(folder, "BOUT.settings"),
-                                     os.path.join(folder, "BOUT.inp"))
+        settings = next((s for s in (os.path.join(folder, "BOUT.settings"),
+                                     os.path.join(folder, "BOUT.inp"),
+                                     os.path.join(data_root, "BOUT.settings"))
                          if os.path.exists(s)), None)
         print(f"loading {datapath}")
         dsi = open_hermesdataset(datapath, inputfilepath=settings,
                                  keep_yboundaries=True, unnormalise=True)
+        if "Ve" not in dsi:
+            # The sheath sets the electron guard velocity too; NVe/Ne evaluated in
+            # that guard does not generally recover the imposed sheath velocity.
+            raise SystemExit("Ve is not in the dump: the electron sheath power "
+                             "cannot be taken from NVe/Ne in the guard cells. Save Ve "
+                             "([e] diagnose = true) and re-run.")
+        if f"V{ion_species}" not in dsi:
+            print(f"  V{ion_species} absent: reconstructing the full sheath "
+                  "from interior momentum (before time averaging)")
+            dsi = recover_target_ion_velocity(dsi, ion_species, AA_ion, Z_ion)
         shapes.append((datapath, dsi.sizes[h3t.detect_poloidal_dim(dsi)]))
         # De-duplicate the restart overlap by TIME VALUE (running max), not by
         # dropping each folder's first frame: a folder squashed to a single
@@ -167,12 +221,8 @@ def _compute():
     ixseps1 = int(m.get("ixseps1", ds.sizes["x"] // 2))
 
     _bnd, has_guards = get_target_boundaries(ds)
-    if has_guards:
-        print(f"y-boundary guard cells present (ny={ds.sizes[pdim]}) — "
-              "profiles interpolated to the target plate.")
-    else:
-        print("WARNING: no y-boundary guard cells — target values fall back to "
-              "the last domain cell. Re-squash with keep_yboundaries=True.")
+    _report_guard_status(has_guards, ds.sizes[pdim], m.get("ny"),
+                         _expected_guard_rows(m))
 
     print(f"Time-averaging over all {ds.sizes['t']} loaded frames")
     ds_avg = ds.mean("t")
@@ -187,14 +237,6 @@ def _compute():
         ds_avg = ds_avg.assign_coords(
             {c: (v.mean("t") if "t" in v.dims else v) for c, v in _lost.items()})
         print(f"  restored coords dropped by mean('t'): {sorted(_lost)}")
-
-    Pe  = ds_avg["Pe"]
-    Pi  = ds_avg[f"P{ion_species}"]
-    Ve  = get_parallel_velocity(ds_avg, "e")
-    Vi  = get_parallel_velocity(ds_avg, ion_species)
-    Ve  = Ve.where(np.isfinite(Ve), 0.0)
-    Vi  = Vi.where(np.isfinite(Vi), 0.0)
-    phi = ds_avg["phi"] if use_phi_gamma else None
 
     all_targets = get_target_y_indices(ds_avg)
     print(f"Targets found: {list(all_targets.keys())}")
@@ -293,7 +335,8 @@ def _compute():
         print(f"  mean of per-frame q vs q of mean fields: max {_d:.1f} % of peak"
               f"   ({_nt} frames)")
         q_MWm2 = q_snap_MWm2 if target_mean == "per_snapshot" else q_avg_MWm2
-        # Preserve radial coordinates and integrate the profile used by the plot.
+        # Integrate the profile that is plotted (fxv8): with per_snapshot this
+        # is ⟨q(P,V)⟩, not q(⟨P⟩,⟨V⟩). Copy q_avg to keep its radial coords.
         q_selected = q_avg.copy(data=q_MWm2 * 1e6)
         P_total_kW = float(total_target_power(ds_avg, q_selected, y_idx)) / 1e3
         print(f"  total power = {P_total_kW:.2f} kW   [{coord_label}]")
@@ -410,7 +453,9 @@ def _compute():
             g = list(range(_myg)) + list(range(_ny + _myg, _ny + 2 * _myg))
         return [i for i in range(npol) if i not in set(g)]
 
-    W_t, t_s, dWdt = np.zeros(0), np.zeros(0), None
+    W_t, dWdt = np.zeros(0), None
+    # Preserve averaging timestamps even if the stored-energy calculation fails.
+    t_s = np.atleast_1d(np.asarray(ds["t"].values, dtype=float))
     try:
         _vol = (_no_t(ds["J"]) * _no_t(ds["dx"])
                 * _no_t(ds["dy"]) * _no_t(ds["dz"]))        # [m³] per cell
@@ -421,7 +466,6 @@ def _compute():
         # Σ_z dz = 2π/zperiod, so ×zperiod gives the full torus.
         _W = _W.sum(dim=[d for d in ("x", pdim, zdim) if d in _W.dims]) * _zper
         W_t = np.atleast_1d(np.asarray(_W.values, dtype=float))
-        t_s = np.atleast_1d(np.asarray(ds["t"].values, dtype=float))
         if W_t.size > 1 and np.ptp(t_s) > 0:
             dWdt = float(np.linalg.lstsq(
                 np.vstack([t_s, np.ones_like(t_s)]).T, W_t, rcond=None)[0][0])
@@ -440,6 +484,10 @@ def _compute():
         dWdt=dWdt if dWdt is not None else float("nan"),
         ion_species=ion_species,
         fit_coordinate=fit_coordinate,
+        has_yguards=bool(has_guards),
+        ny_loaded=int(ds.sizes[pdim]),
+        ny_domain=int(m.get("ny", -1)),
+        ny_expected=int(_expected_guard_rows(m) or -1),
     )
 
 
@@ -486,9 +534,8 @@ _cache_pkl = h3t.cache_path("v3_target_heatflux", dir_range,
                             "diag" if prefer_diagnostics else "nodiag",
                             f"Z{Z_ion:g}",
                             "psimid" if gridfile else "rowmid",
-                            "fxv8")
-                                       # fxv8: power integrates the selected mean profile
-                                       # fxv2: f_x column; fxv3: per-frame q_t for the ±1σ band,
+                            "algn_recVi_Ve_fxv10")    # fxv10: require Ve; use transform-aware sheath alignment/reconstruction
+                                       # fxv2: f_x column;  fxv3: per-frame q_t for the ±1σ band,
                                        # fxv4: POWER BUDGET (grid P_src + storage term),
                                        # fxv5: Hermes-3 sheath power diagnostic,
                                        # fxv6: total_target_power drops x-guards,
@@ -499,12 +546,21 @@ _cache_pkl = h3t.cache_path("v3_target_heatflux", dir_range,
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)
+    _ny_exp = _C.get("ny_expected")
+    _report_guard_status(_C.get("has_yguards"), _C.get("ny_loaded"),
+                         _C.get("ny_domain"),
+                         None if _ny_exp is None or int(_ny_exp) < 0 else int(_ny_exp),
+                         cached=True)
 else:
     _C = _compute()
     h3t.save_cache(_cache_pkl, **_C)
     print(f"Saved cache: {_cache_pkl}")
 globals().update(_C)
 per_target = _unflatten_targets(_C)
+_first_q_t = next(iter(per_target.values())).get("q_t_MWm2") if per_target else None
+_averaging_times = profile_times(
+    _C, _cache_pkl, expected_frames=len(_first_q_t) if _first_q_t is not None else None)
+_averaging_label = time_label(_averaging_times, mode=time_label_mode)
 
 
 # ── Apply fits + plot from cached per-target profiles ────────────────────────
@@ -575,7 +631,7 @@ for ax_hf, ax_eich, tgt in zip(axes_hf, axes_eich, targets):
                            q_MWm2 + target_band_n * q_sd,
                            color="b", alpha=0.20, lw=0, zorder=0,
                            label=rf"$\pm{target_band_n:g}\sigma_t$ "
-                                 rf"({q_t.shape[0]} frames)")
+                                 f"({_averaging_label})")
     ax_hf.plot(s_mm, q_MWm2, "b.-", ms=4)
     ax_hf.axvline(0, color="k", ls="--", lw=0.8)
     if ep is not None and abs(ep["s0"]) > 0.05:
@@ -692,9 +748,10 @@ print("  60 % is the expected ceiling, not 100 %. Use v3_plasma_balance.py for")
 print("  the core/SOL/PFR radial split before suspecting the sheath formula.")
 print("=" * 92)
 
-fig_hf.suptitle("Target heat flux profiles (time-averaged)", y=1.02)
+fig_hf.suptitle(f"Target heat flux profiles ({_averaging_label})", y=1.02)
 fig_hf.tight_layout()
 fig_eich.suptitle(f"Eich (red) + double-exp (green) — {fit_coordinate} coordinate"
+                  + f"  [{_averaging_label}]"
                   + (f"  [fit_s0={fit_s0}]" if fit_s0 else ""),
                   y=1.02)
 fig_eich.tight_layout()
