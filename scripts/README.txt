@@ -20,7 +20,6 @@ targets/ — divertor heat loads and cross-checks
   v3_target_heatflux.py       Multi-folder averaged target analysis.
   target_heatflux.py          Single-folder target heat flux and electron/ion split.
   target_profiles.py          Plate density, temperatures, pressure, and ion current.
-  compare_target_profiles.py Overlay cached target profiles across cases.
   target_poloidal_check.py    Target sheath load versus upstream poloidal power.
   validate_poloidal_efe.py    Heat-flux formulas versus saved Y-face diagnostics.
 
@@ -61,64 +60,16 @@ shared template from scripts/config_analysis.ini there. Others use a CONFIG
 block or command-line arguments; see each script's header. Review case paths
 and settings before running.
 
-Comparing target heat-flux profiles
-----------------------------------
-First run targets/v3_target_heatflux.py for each case over the desired time
-window. For true midplane distances, set gridfile and fit_coordinate="omp"
-before generating the caches. Check matching sheath-model
-settings and appropriate averaging windows across cases yourself: the caches
-do not record every calculation setting. No simulation files are opened by
-the comparison script.
+Target heat-flux profiles
+------------------------
+Run targets/v3_target_heatflux.py over the desired time window. For true
+midplane distances, set gridfile and fit_coordinate="omp". Plate interpolation
+requires retained y-boundary guards. Cache hits report recorded guard status;
+recompute caches after resquashing or changing calculation settings.
 
-v3_target_heatflux.py stops before calculating if loaded dumps have no
-y-boundary guards. Caches record guard presence and loaded/domain y sizes;
-cache hits report that recorded status. Legacy caches without the status warn
-that plate heat flux is unverified: set use_cache=False after resquashing.
-Guard presence enables plate interpolation but does not certify sheath-model
-choices, averaging windows, or fitted widths.
-
-Edit root and CASES in targets/compare_target_profiles.py, or run:
-  python scripts/targets/compare_target_profiles.py \
-    --case "coarse" /path/to/coarse/cache/v3_target_heatflux_....npz \
-    --case "fine" /path/to/fine/cache/v3_target_heatflux_....npz \
-    --targets outer_lower outer_upper --xlim -5 40 --save targets.png
-
-Each target has a separate panel. Default rows are inner_upper / outer_upper,
-then inner_lower / outer_lower; --targets specifies a custom order.
-The coordinate comes from the cache:
-OMP/IMP mapping, physical target distance, or wetted distance. Different
-coordinate labels within a panel are rejected. Old midplane-row mappings
-warn because coarse grids can distort that distance; regenerate with a grid
-to obtain the true midplane mapping. The script does not remap old caches.
-Heat flux retains its cached definition in MW/m^2 regardless of coordinate.
-
-Default: remove two radial guard cells at each end (--mxg 0 keeps all), plot
-the arithmetic mean of per-frame heat flux and shade +/-1 sample standard
-deviation over time. This band describes variation, not uncertainty in the
-mean. One frame has no band. Caches without per-frame flux warn and use their
-saved mean; nonfinite retained profiles are rejected. No fits are made.
---normalise peak compares shapes using each profile's peak within --xlim;
-the same factor scales its band. The console reports unnormalized peaks and
-their locations within that window. --no-band hides shading, --band-n changes
-its width, --logy sets a log axis, and --no-show supports batch PNG output.
-
-Comparison legends show the averaging span in milliseconds (for example,
-"nx68 ny52 (Δt=15.0 ms)"). Set time_label_mode="range" in a comparison
-script to show the start/end interval instead. Both forms use actual retained
-timestamps; console output also reports the interval. A single snapshot is
-identified explicitly. This changes labels only; means and bands retain
-their existing snapshot weighting.
-v3_target_heatflux.py uses the same time labels in its band legend and
-profile/fit figure titles, including when the band is disabled.
-
-Target caches already save t_s in seconds. New v3_radial_flux.py caches also
-save t_s. For older caches the comparison reads only squash timestamp metadata
-from the numbered folders next to cache/, applies the original restart
-deduplication, and requires a matching cached frame count. Recovery warns
-because the files may have changed since caching. If exact timestamps cannot
-be recovered, the legend says "time unavailable"; no nominal dump interval
-is assumed. Copy hermes3_turb/profile_time.py along with the updated scripts
-when updating an existing package installation.
+Profile bands show per-snapshot variation rather than uncertainty in the mean.
+Time labels use retained timestamps in milliseconds; time_label_mode="range"
+shows the start and end instead of the span. A single snapshot is identified.
 
 Preparing grid sources and anomalous diffusivities
 -------------------------------------------------

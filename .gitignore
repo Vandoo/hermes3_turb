@@ -2,6 +2,8 @@
 /docs/
 /scripts/turbulence/
 /scripts/resolution_scan/
+/scripts/targets/compare_*.py
+/tests/test_compare_target_profiles.py
 
 # Python and test/build artifacts
 __pycache__/

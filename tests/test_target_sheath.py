@@ -290,8 +290,7 @@ class TestChannelSplit(unittest.TestCase):
             self.assertIn(key, tp)
         self.assertIn("components=True", tp)
         # and it must NOT have been bolted onto the heat-flux machinery
-        for name in ("target_heatflux.py", "v3_target_heatflux.py",
-                     "compare_target_profiles.py"):
+        for name in ("target_heatflux.py", "v3_target_heatflux.py"):
             src = (root / name).read_text()
             self.assertNotIn("Ne_avg", src, f"{name} should not carry profiles")
 
