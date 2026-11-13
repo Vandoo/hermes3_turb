@@ -6,17 +6,16 @@ Includes particle and heat fluxes, conservation checks, divertor target
 profiles, geometry diagnostics, run monitoring, restart tools, and grid source /
 anomalous-transport preparation.
 
-Install in your analysis environment:
+Install in an analysis environment:
   python3 -m pip install -e .
 
 Scripts that load Hermes-3 data also require xhermes. The reusable package
 provides analysis functions; use xhermes, xbout, or boutdata directly for
 loading. Start with scripts/README.txt for the script catalogue.
 
-Target heat flux scripts require saved Ve ([e] diagnose=true). Missing Vi/Ti
-is supported through the validated full-sheath reconstruction before averaging;
-retain all target guard cells and use the updated target.py with the scripts.
-The target cache version is algn_recVi_Ve_fxv10; older caches are recomputed.
+Target heat flux scripts require saved Ve ([e] diagnose=true) and retained
+target guard cells. For the full sheath model, missing Vi/Ti can be
+reconstructed before time averaging.
 
 Scripts are grouped into fluxes/, balances/, targets/, geometry/,
 run_diagnostics/, restarts/, and grid_tools/. Most use a CONFIG block; some use
@@ -33,3 +32,15 @@ Run synthetic regression tests from this checkout:
 The tests cover selected calculations and known regressions, not complete
 validation against real runs. Check units, species, guard cells, averaging
 windows, and diagnostic availability when interpreting results.
+
+Energy and balance conventions
+------------------------------
+The perpendicular ExB energy flux uses (3/2) P v_E. Parallel advection,
+diamagnetic drift, and magnetic flutter retain their channel coefficients.
+Volume integrals exclude boundary guards by default. energy_source() converts
+a saved pressure source to an internal-energy source using the factor 3/2.
+Use parallel_energy_flow_ylow() to select parallel energy-flow channels; the
+published ef*_tot_ylow may include diagnostic-only viscous heating.
+
+Target heat flux can return electron/ion components and plate profiles
+through components=True. Cache names include a calculation-format version.

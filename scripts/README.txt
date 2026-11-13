@@ -18,6 +18,9 @@ balances/ — sources, inventories, and conservation
 
 targets/ — divertor heat loads and cross-checks
   v3_target_heatflux.py       Multi-folder averaged target analysis.
+  target_heatflux.py          Single-folder target heat flux and electron/ion split.
+  target_profiles.py          Plate density, temperatures, pressure, and ion current.
+  compare_target_profiles.py Overlay cached target profiles across cases.
   target_poloidal_check.py    Target sheath load versus upstream poloidal power.
   validate_poloidal_efe.py    Heat-flux formulas versus saved Y-face diagnostics.
 
@@ -35,6 +38,8 @@ run_diagnostics/ — run histories, health, and performance
   cvode_report.py            Compare CVODE solver statistics from logs.
   parse_slurm_speed.py       Parse Slurm output and simulation speed.
   run_ledger.py              Restart history, inputs, binaries, and run status.
+  lcfs_transport_monitor.py  LCFS channel fluxes and effective turbulent transport.
+  flux_limiter_check.py      Estimate where conduction/viscosity limiters act.
 
 restarts/ — tools that write restart or interpolated data files
   refine_restart.py          Refine/coarsen grids and produce restart files.
@@ -50,11 +55,70 @@ Install the package or put the package checkout on PYTHONPATH. Run scripts
 by path, for example:
   python /path/to/hermes3_turb/scripts/targets/v3_target_heatflux.py
 
-Keep the working directory appropriate for your case. Scripts that read
+Run from the appropriate case directory. Scripts that read
 config_analysis.ini still read it from the current working directory; copy the
 shared template from scripts/config_analysis.ini there. Others use a CONFIG
 block or command-line arguments; see each script's header. Review case paths
 and settings before running.
+
+Comparing target heat-flux profiles
+----------------------------------
+First run targets/v3_target_heatflux.py for each case over the desired time
+window. For true midplane distances, set gridfile and fit_coordinate="omp"
+before generating the caches. Check matching sheath-model
+settings and appropriate averaging windows across cases yourself: the caches
+do not record every calculation setting. No simulation files are opened by
+the comparison script.
+
+v3_target_heatflux.py stops before calculating if loaded dumps have no
+y-boundary guards. Caches record guard presence and loaded/domain y sizes;
+cache hits report that recorded status. Legacy caches without the status warn
+that plate heat flux is unverified: set use_cache=False after resquashing.
+Guard presence enables plate interpolation but does not certify sheath-model
+choices, averaging windows, or fitted widths.
+
+Edit root and CASES in targets/compare_target_profiles.py, or run:
+  python scripts/targets/compare_target_profiles.py \
+    --case "coarse" /path/to/coarse/cache/v3_target_heatflux_....npz \
+    --case "fine" /path/to/fine/cache/v3_target_heatflux_....npz \
+    --targets outer_lower outer_upper --xlim -5 40 --save targets.png
+
+Each target has a separate panel. Default rows are inner_upper / outer_upper,
+then inner_lower / outer_lower; --targets specifies a custom order.
+The coordinate comes from the cache:
+OMP/IMP mapping, physical target distance, or wetted distance. Different
+coordinate labels within a panel are rejected. Old midplane-row mappings
+warn because coarse grids can distort that distance; regenerate with a grid
+to obtain the true midplane mapping. The script does not remap old caches.
+Heat flux retains its cached definition in MW/m^2 regardless of coordinate.
+
+Default: remove two radial guard cells at each end (--mxg 0 keeps all), plot
+the arithmetic mean of per-frame heat flux and shade +/-1 sample standard
+deviation over time. This band describes variation, not uncertainty in the
+mean. One frame has no band. Caches without per-frame flux warn and use their
+saved mean; nonfinite retained profiles are rejected. No fits are made.
+--normalise peak compares shapes using each profile's peak within --xlim;
+the same factor scales its band. The console reports unnormalized peaks and
+their locations within that window. --no-band hides shading, --band-n changes
+its width, --logy sets a log axis, and --no-show supports batch PNG output.
+
+Comparison legends show the averaging span in milliseconds (for example,
+"nx68 ny52 (Δt=15.0 ms)"). Set time_label_mode="range" in a comparison
+script to show the start/end interval instead. Both forms use actual retained
+timestamps; console output also reports the interval. A single snapshot is
+identified explicitly. This changes labels only; means and bands retain
+their existing snapshot weighting.
+v3_target_heatflux.py uses the same time labels in its band legend and
+profile/fit figure titles, including when the band is disabled.
+
+Target caches already save t_s in seconds. New v3_radial_flux.py caches also
+save t_s. For older caches the comparison reads only squash timestamp metadata
+from the numbered folders next to cache/, applies the original restart
+deduplication, and requires a matching cached frame count. Recovery warns
+because the files may have changed since caching. If exact timestamps cannot
+be recovered, the legend says "time unavailable"; no nominal dump interval
+is assumed. Copy hermes3_turb/profile_time.py along with the updated scripts
+when updating an existing package installation.
 
 Preparing grid sources and anomalous diffusivities
 -------------------------------------------------
@@ -100,3 +164,24 @@ guards. D and chi are Field2D; nu is Field3D, repeated across every z plane
 Existing fields are updated. Species anomalous_D, anomalous_chi and
 anomalous_nu input options override grid fields; leave them unset to use
 these profiles. The applicable anomalous_diffusion component must be enabled.
+
+LCFS transport and plasma limiter diagnostics
+---------------------------------------------
+  python scripts/run_diagnostics/lcfs_transport_monitor.py GRID DUMP [DUMP ...] [SPECIES]
+  python scripts/run_diagnostics/flux_limiter_check.py DUMP --species e i --alphas 0.1 0.3 1
+
+The LCFS monitor loads data with xhermes and reports channel fluxes, effective
+transport, and fluctuation levels. Limiter diagnostics require NumPy and
+netCDF4, saved kappa_par_<species>, and a run whose limiter is disabled. They
+estimate local suppression of classical flux; they do not predict a new
+steady state. Ion viscosity assumes matching conduction/viscosity collision
+sets; the electron viscosity estimate is an upper bound. Use --help for
+species, atomic-mass, coefficient, frame, and output options.
+
+Plate plasma profiles
+---------------------
+Edit CASES in targets/target_profiles.py for the data folders and grid files.
+It computes sheath-plane Ne, Ni, Te, Ti, pressure, and ion saturation current
+separately from the heat-flux caches. Ion reconstruction
+uses each folder's archived settings before combining frames. Guardless input
+is reported as a last-domain-cell estimate rather than a plate measurement.

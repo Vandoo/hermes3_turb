@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-turbulence_monitor.py — is the run turbulent yet, and has it saturated?
+Monitor fluctuation amplitude and background-profile steadiness.
 
 
-  1. Fluctuation growth/saturation (Ben Dudson's recipe)
+  1. Fluctuation growth and saturation
        δf = f − ⟨f⟩_z            (remove the toroidal average so the metric
                                    is not swamped by slow profile drift)
        amplitude(t) = √(⟨δf²⟩_z)  — RMS over the toroidal direction
@@ -14,13 +14,12 @@ turbulence_monitor.py — is the run turbulent yet, and has it saturated?
 
   2. Profile steadiness (the nsep / Tsep check, as in h2_times.py)
      Toroidally-averaged separatrix density and temperature at the outer
-     midplane vs time — a turbulent run is "done initializing" once these stop
-     trending and just fluctuate about a steady mean.
+     midplane vs time — profile steadiness requires small trends relative to the fluctuations.
 
   3. Monitor location: outer-midplane separatrix by default (OMP, x = ixseps1),
      which is where the interchange/drift-wave drive is strongest. A radial profile
      of the relative fluctuation level at the final saturated window is also shown so
-     you can see *where* the turbulence lives.
+     show the radial distribution of fluctuations.
 
 Loading
 -------
@@ -133,14 +132,7 @@ def _load():
         except Exception as e:                                   # noqa: BLE001
             print(f"  [skip] failed to load {datapath}: {e}")
             continue
-        # NB do NOT drop each folder's first frame here. A folder squashed to
-        # a SINGLE output time then contributes nothing at all, and N such
-        # folders collapse to one frame -- measured on
-        # sxd_MU/from_archer_6kW/403-408, where folders 404/405/407/408 hold
-        # exactly 1 frame each and would vanish, halving the series silently.
-        # Restart overlap is removed after concatenation by time VALUE with a
-        # running max, as blobs.open_time_series and v3_target_heatflux do
-        # (403 and 404 there really do share t=726111.1).
+        # Retain first frames until restart overlaps are removed by time value.
         datasets.append(dsi)
 
     if not datasets:
@@ -173,7 +165,7 @@ def _load():
 
 
 # Standard background fields always reduced (needed for panel 2 / steadiness),
-# on top of whatever `fields` the user configured.
+# on top of the configured `fields`.
 STD_FIELDS = ("Ne", "Pe", "Te", "Ti")
 
 
@@ -195,7 +187,7 @@ def _compute():
     THIS is the expensive step (it reads every timestep of the 3-D fields). The
     verdict and all three panels derive from these 2-D arrays alone — the
     monitor-location series is a column/slice, the radial profile a time-average,
-    etc. — so they are what we cache. A rerun to change sat_window, the
+    etc. These reductions are cached. A rerun to change sat_window, the
     thresholds, or location is then instant and needs no reload.
     """
     ds = _load()

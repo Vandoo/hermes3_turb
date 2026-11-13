@@ -266,7 +266,7 @@ def print_option_diff(runs):
                                       for r in runs))
     if len({r["hermes_git"] for r in runs}) > 1:
         print("  WARNING: different Hermes git versions - a speed difference may be the "
-              "code change, not the setting you meant to test")
+              "code change rather than an isolated setting change")
     if len({r["binary"] for r in runs}) > 1:
         print("  binaries: " + " | ".join(f"{r['name']}={r['binary']}" for r in runs))
 

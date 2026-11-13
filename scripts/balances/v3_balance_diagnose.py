@@ -14,10 +14,12 @@ For the chosen species this script reports
     dN/dt  = ΔN_core / Δt               (loaded time window)
     closure = (F + dN/dt) / S
 
-and the analogous quantities for energy (Pe_src vs 5/2 P·v_E, with internal
-energy storage 3/2 d∫P/dt). It also prints a geometry sanity check
-(torus volume, LCFS area) in physical SI by rescaling with rho_s0, and plots
-the per-frame LCFS flux to expose transients and statistical scatter.
+and the analogous quantities for energy: the source is 3/2·Pe_src (Hermes-3
+evolves the PRESSURE, the internal energy is 3/2 P), the flux is the 5/2
+enthalpy flux, and the storage is 3/2 d∫P dV/dt. All three factors are needed
+for the closure to mean anything. It also prints a geometry sanity check (torus
+volume, LCFS area) in physical SI by rescaling with rho_s0, and plots the
+per-frame LCFS flux to expose transients and statistical scatter.
 
 Edit the CONFIG block below and run.
 """
@@ -97,40 +99,17 @@ ds = h3t.dedup_restart_times(ds)
 zdim = h3t.detect_toroidal_dim(ds)
 pdim = h3t.detect_poloidal_dim(ds)
 
-# ── Drop y-boundary guard rows if the load kept them ──────────────────────
-# xBOUT honours the GRID's `y_boundary_guards`, so a grid built with
-# y_boundary_guards=2 returns a guard-retaining dataset even when this
-# script asks for keep_yboundaries=False. That is not merely untidy:
-# `.bout.ddy()` returns only the domain rows but RE-LABELS them onto the
-# FIRST n_domain theta values rather than the domain rows' own labels.
-# xarray then inner-joins on those labels inside `ExB_radial_velocity`, so
-# each domain cell's ∂φ/∂θ is paired with the ∂φ/∂ζ and metric of a
-# *different* cell — offset by the guards, and wrong everywhere past the
-# first guard pair, not just at the ends.
-# Visible symptom: Fig 1 dies in pcolormesh with
-#   Dimensions of C (244, 112) should be one smaller than X(120)
-# Invisible symptom: a mis-registered ExB flux, plus `Gamma_mag_*` left on
-# the full 120 axis (load_grid_vars pads to the dataset) and `j1/j2`
-# computed for the guarded layout — so the θ-band of every 1-D profile is
-# taken from the wrong rows.
-# Measured on from_archer_6kW/data/396 (grid ny=112, MYG=2 → 120 rows):
-# ddy returns theta == full[:112] exactly, confirming the re-labelling.
-# Guard layout is this codebase's usual one: region A at +MYG, B at +3·MYG.
+# Remove retained y-guards before poloidal derivatives.
+# xBOUT derivative coordinates require the interior poloidal layout.
 import netCDF4 as _nc_g
 with _nc_g.Dataset(gridfile) as _g0:
     _ny_g = int(_g0["ny"][:])
-_MYG0 = int(ds.metadata.get("MYG", 2))
-_nyi0 = int(ds.metadata.get("ny_inner", 0) or 0)
+# The guard count per band is derived from the dump (npol - ny), NOT from
+# MYG: a grid with y_boundary_guards=1 gives ny+4 rows while MYG reports
+# 2, so a `npol == ny + 4*MYG` test matches neither layout and strips
+# nothing. One implementation, in h3t.guard_rows.
 _npol = ds.sizes[pdim]
-if _nyi0 > 0 and _npol == _ny_g + 4 * _MYG0:            # double null
-    _guard_rows = (list(range(_MYG0))
-                   + list(range(_nyi0 + _MYG0, _nyi0 + 3 * _MYG0))
-                   + list(range(_ny_g + 3 * _MYG0, _ny_g + 4 * _MYG0)))
-elif _npol == _ny_g + 2 * _MYG0:                        # single null
-    _guard_rows = (list(range(_MYG0))
-                   + list(range(_ny_g + _MYG0, _ny_g + 2 * _MYG0)))
-else:
-    _guard_rows = []
+_guard_rows = h3t.guard_rows(ds, ny_grid=_ny_g)
 if _guard_rows:
     _keep_rows = [i for i in range(_npol) if i not in set(_guard_rows)]
     print(f"  dataset kept y-guards despite keep_yguards={keep_yguards} "
@@ -251,8 +230,22 @@ F_eng  = lcfs_flux(q_r)
 
 
 # ── Volume-integrated sources ────────────────────────────────────────────────
-S_part = float(h3t.volume_integral(ds, ds[src_n_name])) if src_n_name in ds else 0.0
-S_eng  = float(h3t.volume_integral(ds, ds[src_P_name])) if src_P_name in ds else 0.0
+# `energy_source` carries the 3/2 (Hermes-3 evolves P; the internal energy is
+# 3/2 P), so S_eng is comparable with the 5/2 enthalpy flux and the 3/2
+# storage term. `volume_integral` sums interior cells only (x- and y-guards
+# dropped).
+_src_n = h3t.particle_source(ds, species)
+_src_q = h3t.energy_source(ds, species)          # = 3/2 * P<sp>_src
+if _src_n is None or _src_q is None:
+    _missing = [nm for nm, v in ((src_n_name, _src_n), (src_P_name, _src_q))
+                if v is None]
+    print(f"\n  !! WARNING: {', '.join(_missing)} not in the dump for "
+          f"species '{species}'. The corresponding source is taken as 0, so "
+          f"its closure is meaningless, not 'bad'. Save the source(s) or pick "
+          f"a species the dump carries "
+          f"(present: {sorted(v for v in ds.data_vars if v.endswith('_src'))}).")
+S_part = float(h3t.volume_integral(ds, _src_n)) if _src_n is not None else 0.0
+S_eng  = float(h3t.volume_integral(ds, _src_q)) if _src_q is not None else 0.0
 
 
 # ── Inventory time series (closed-core volume: x < ixseps1, all θ) ───────────
@@ -329,18 +322,35 @@ print("  (closure → 100% in steady state; if <100% with dInv/dt > 0, the core 
 print("   still filling — flux has not yet caught up with the source)")
 
 
-# ── Geometry sanity (rescale BOUT-normalised metric to SI) ───────────────────
+# Geometry in SI: volume excludes guards; LCFS area excludes divertor legs.
 rho_s0 = float(m.get("rho_s0", 1.0))
-V_norm = float((J * dx * dy).sum(("x", pdim))) * 2 * np.pi
-_A = elem.isel(x=ixsep1).sum(pdim)
-_extra = list(_A.dims)
-if _extra:
-    _A = _A.mean(dim=_extra)
-A_norm = float(_A) * 2 * np.pi
+_interior = h3t.interior_mask(ds)                 # (x, θ), guards False
+_dV = (J * dx * dy).where(xr.DataArray(_interior, dims=("x", pdim)), other=0.0)
+V_norm = float(_dV.sum(("x", pdim))) * 2 * np.pi
+
+def _area_at(x_idx, rows):
+    """Flux-surface area per 2π at x=x_idx over the given poloidal rows."""
+    a = elem.isel(x=x_idx)
+    a = a.isel({pdim: list(rows)}) if rows is not None else a
+    a = a.sum(pdim)
+    _left = list(a.dims)
+    if _left:
+        a = a.mean(dim=_left)
+    return float(a) * 2 * np.pi
+
+_bands = h3t.sol_band_regions(ds)                 # {name: (y0, y1)}, legs excluded
+_lcfs_rows = [j for y0, y1 in _bands.values() for j in range(y0, y1)]
+A_norm     = _area_at(ixsep1, _lcfs_rows)         # true LCFS: HFS + LFS bands
+A_all_norm = _area_at(ixsep1, None)               # every θ, legs included
 print(f"\n===== Geometry sanity =====")
 print(f"  rho_s0  = {rho_s0:.3e} m   (from ds.metadata)")
-print(f"  V_torus = {V_norm:.3e} (normalised)  →  {V_norm * rho_s0**3:.3f} m³")
-print(f"  A_LCFS  = {A_norm:.3e} (normalised)  →  {A_norm * rho_s0**2:.3f} m²")
+print(f"  V_torus = {V_norm:.3e} (normalised)  →  {V_norm * rho_s0**3:.3f} m³"
+      f"   (interior cells only)")
+print(f"  A_LCFS  = {A_norm:.3e} (normalised)  →  {A_norm * rho_s0**2:.3f} m²"
+      f"   ({', '.join(f'{k} {y0}:{y1}' for k, (y0, y1) in _bands.items())})")
+print(f"  A(x=ixseps1), all θ = {A_all_norm:.3e}  →  "
+      f"{A_all_norm * rho_s0**2:.3f} m²   (adds the four divertor legs — "
+      f"NOT the LCFS area)")
 
 
 # ── Plots ────────────────────────────────────────────────────────────────────

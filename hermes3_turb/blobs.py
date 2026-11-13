@@ -100,9 +100,8 @@ def omp_index(ds):
 
     Note the guard test is ``ds.sizes[pdim] > metadata['ny']``: a squashed dump
     written *with* y-boundary guards has a larger poloidal size than the
-    guardless ``ny`` from the grid. Both kinds occur in practice (an SXD case
-    is ``y=44`` with guards, ``y=36`` without), and the midplane index differs
-    between them — 29 vs 23 for that case — so never hard-code it.
+    guardless ``ny`` from the grid. The midplane index is computed for the
+    retained guard layout rather than hard-coded.
     """
     from .target import get_midplane_y_indices
     return int(get_midplane_y_indices(ds)["omp"])
@@ -218,41 +217,16 @@ def poloidal_markers(ds):
 
 def exb_radial_velocity_slice(ds, y_idx, phi=None, include_y_derivs=True,
                               z_deriv="centred"):
-    """Radial ExB drift velocity [m/s] on one poloidal slice, shape ``(t,x,z)``.
+    """Calculate radial ExB velocity [m/s] on one poloidal slice, shape (t,x,z).
 
-    Same formula as :func:`hermes3_turb.fluxes.ExB_radial_velocity`,
+    The expression matches fluxes.ExB_radial_velocity, including the optional
+    poloidal non-orthogonality term. Centred poloidal differences require a
+    slice away from branch cuts. Input normalisation determines the SI conversion.
 
-        v_ExB,r = ( ∂φ/∂ζ − (g_23/g_22)·∂φ/∂θ ) / √g11
-
-    but evaluated with plain finite differences on a three-slice stencil rather
-    than through xBOUT's ``.bout.ddz()``. That removes the need for
-    ``geometry="toroidal"``, so it works on a guard-retaining squashed dump
-    that has no matching guardless grid file.
-
-    The ``g_23/g_22`` ratio is formed with **both** components in normalised
-    units, because xhermes unnormalises ``g_22`` but not ``g_23``.
-
-    ``include_y_derivs=True`` (the Hermes-3 convention) keeps the
-    non-orthogonality correction; ``False`` reproduces the STORM convention.
-    Note the θ-derivative uses a centred difference, so it is only valid away
-    from branch cuts — fine at the midplane, not at an X-point.
-
-    ``z_deriv`` selects how ``∂φ/∂ζ`` is taken, and the two answers differ by
-    a lot for a marginally resolved filament. A centred difference damps the
-    gradient by ``sin(k dz)/(k dz)``: measured on a Gaussian of the SXD OMP
-    binormal cell size (4.6 mm = 5.7 ρ_s), the centred value is **0.53 / 0.69
-    / 0.91 / 0.98** of the exact one for a structure spanning 0.7 / 1.3 / 2.6
-    / 5.3 cells. On runs where the median ``size_b`` prints as one cell, the
-    diagnostic alone therefore loses 30-47 % of the radial ExB velocity.
-
-    * ``'centred'`` (default) matches the finite-difference operator the
-      *simulation itself* used, so it reports the velocity the code actually
-      advected with — the right choice for a budget or a flux.
-    * ``'fft'`` is exact for the stored field (ζ is exactly periodic, so the
-      FFT has no boundary error) and reports the velocity the φ field
-      *implies*. Use it to measure how much of a slow blob velocity is
-      binormal under-resolution rather than physics; the gap between the two
-      is that headroom.
+    z_deriv='centred' uses a finite difference in the periodic direction;
+    its Fourier response is sin(k*dz)/(k*dz). z_deriv='fft' differentiates the
+    stored periodic field spectrally. Marginally resolved structures can give
+    substantially different gradients under the two choices.
     """
     pdim = detect_poloidal_dim(ds)
     zdim = detect_toroidal_dim(ds)
@@ -893,7 +867,7 @@ def track_binormal_velocity(track, b_period, min_length=3):
     much faster along the binormal than radially, so this component *is* well
     resolved by the frame rate. If it comes out at a sensible fraction of the
     ExB binormal drift, the frame-to-frame linking is sound and a poor radial
-    number is a resolution problem, not a tracking bug.
+    number is a resolution problem, a resolution limitation.
     """
     t = track.times
     b = track.b_unwrapped(b_period)
@@ -919,7 +893,7 @@ def exb_binormal_velocity_slice(ds, y_idx, phi=None):
     it is driven by the **mean radial electric field**, whereas the radial ExB
     velocity is driven by the much smaller fluctuating binormal field. A
     binormal velocity one to two orders of magnitude above the radial one is
-    therefore expected, not a bug — a few kV/m of E_r over a sub-tesla field is
+    therefore expected — a few kV/m of E_r over a sub-tesla field is
     already ~10 km/s.
 
     The overall sign depends on the orientation convention for b̂, so compare
@@ -1040,21 +1014,11 @@ def ccf_radial_velocity(f, r, t, x_ref, x_offsets=(2, 4, 6, 8), max_lag=None,
     in. Correlating at *matched z* — which is what a 1-D lag scan does — then
     measures the stationary radial shape, not the propagation.
 
-    Measured on synthetic blobs with a known ``v_r = 400 m/s``: at
-    ``v_b = 0`` the 1-D scan gives 470 m/s, but at ``v_b = 6000 m/s`` every
-    offset lands at zero lag (no answer at all), and for a narrower blob it
-    returns **113 m/s with ``resolved=True``** — a silent 3.5x
-    *under*-estimate, i.e. exactly the "blobs are too slow" symptom,
-    manufactured by the diagnostic. The 2-D scan recovers 337-487 m/s in
-    every one of those cases and ``v_b`` to 0.3 %. This is also why a real
-    two-probe measurement uses a *poloidally* separated probe pair, or 2-D
-    GPI velocimetry, rather than one radial pair.
-
     ``binormal_scan=True`` (the default) therefore scans ``C(dt_lag, dz_lag)``
     and takes the joint peak, giving ``v_b`` for free. Pass ``b``/``b_period``
     to get ``v_b`` in m/s (without them the binormal shift is still scanned,
     so ``v_r`` is correct, but ``v_b`` comes back in cells/s). Set
-    ``binormal_scan=False`` to reproduce the old matched-z behaviour.
+    ``binormal_scan=False`` for a matched-z scan.
 
     The peak is refined by a parabolic fit through the three samples around
     the maximum in each direction, giving sub-frame and sub-cell resolution —
@@ -1135,34 +1099,16 @@ def ccf_radial_velocity(f, r, t, x_ref, x_offsets=(2, 4, 6, 8), max_lag=None,
 
 
 def ccf_feasibility(v_r, tau_c, size_r, dr_cell, offsets=None, verbose=True):
-    """Can a time-delay cross-correlation measure `v_r` on this case at all?
+    """Assess whether time-delay cross-correlation can resolve radial propagation.
 
-    A TDE/CCF measures a propagation delay between two radii. For that to work
-    the structure must travel **further than its own radial width** while
-    staying correlated, because the offset has to satisfy two bounds at once:
+    A useful separation exceeds the structure width but remains shorter than
+    its propagation distance during one correlation time:
 
-        offset >  size_r      -- else the zero-lag correlation of the
-                                 stationary radial SHAPE dominates and the
-                                 peak pins at lag 0
-        offset <  v_r * tau_c -- else the structure has decorrelated by the
-                                 time it arrives and there is no peak to find
+        size_r < offset < v_r*tau_c
 
-    so the method needs ``L_dec = v_r*tau_c > size_r``. That is a property of
-    the FLOW, not of the analysis, and no choice of ``x_offsets`` fixes it.
-
-    Measured on `from_archer_6kW/609-614`: `v_r = 90 m/s`, `tau_c = 2.09 us`,
-    `size_r = 1.79 mm` give `L_dec = 0.188 mm = 0.68 cells` against a
-    structure of **6.5 cells** — a ratio of **0.11**, i.e. the filament moves
-    11 % of its own width before decorrelating. The CCF is inapplicable there
-    and returned "all peaks at zero lag" at every offset tried, which is the
-    correct answer rather than a tuning failure.
-
-    That ratio is also physics: a structure that decorrelates in place instead
-    of propagating is not a ballistically moving filament, which is consistent
-    with the same case showing a packing fraction of 0.004 and only 3-6 % of
-    the turbulent flux carried by detected structures.
-
-    Returns ``dict`` with ``L_dec``, ``cells_dec``, ``ratio`` and ``feasible``.
+    The diagnostic compares L_dec = v_r*tau_c with size_r and the radial cell
+    width. Returns L_dec, cells_dec, size_r, ratio, and feasible. The criterion
+    is a necessary resolution check, not a guarantee of a reliable CCF estimate.
     """
     L_dec = float(v_r) * float(tau_c)
     ratio = L_dec / float(size_r) if size_r > 0 else np.inf
@@ -1277,34 +1223,19 @@ def turbulent_flux_slice(n, v_r, zdim_axis=2):
 
 def blob_flux_closure(n, v_r, f, r, b, b_period, threshold=2.5, x_slice=None,
                       min_pixels=4, verbose=True):
-    """Packing-fraction flux closure: do the detected blobs carry the flux?
+    """Compare detected-filament particle flux with the fluctuating ExB flux.
 
-    **This is the best end-to-end validation of a blob analysis available, and
-    it has a published expected value.** Mancini et al., Plasma Phys. Control.
-    Fusion **68**, 055029 (2026) (the TCV-X21/X23 GBS validation) estimates
-    the turbulent flux twice and compares:
+        Gamma_ExB = <n*v_r> - <n><v_r>
+        Gamma_fil = f_p * <n>_fil * <v_r>_fil
 
-        eq (3)  Gamma_ExB = <n v_r> - <n><v_r>          (the fluctuating flux)
-        eq (5)  Gamma_fil = f_p <n>_fil <v_r>_fil       (from detection alone)
+    f_p is the mean detected cross-sectional area divided by the sampled SOL
+    area. The returned ratio_dn uses excess density; ratio_n uses total density.
+    State the density convention when reporting a closure ratio.
 
-    with ``f_p`` the **packing fraction** — mean blob cross-sectional area
-    divided by the total SOL area. They find ``Gamma_fil/Gamma_ExB`` close to
-    **unity at the outer midplane**, with ``f_p = (5.9 ± 0.2)e-2`` for
-    TCV-X21/X23-low and ``(7.2 ± 0.3)e-2`` for X23-high. So a run whose ratio
-    is far from 1 at the OMP has a detection/threshold/velocity problem, and
-    the number to aim at is not invented here.
-
-    Their stated failure modes are worth knowing before over-reading it: in
-    the **divertor** the detection *overestimates* filament properties near
-    the separatrix and badly *underestimates* in the far SOL (detection events
-    become rare), and they conclude the fluctuating ExB flux is the more
-    reliable of the two there. Use this closure at the midplane.
-
-    Two variants are returned because eq (5) does not say whether ``<n>_fil``
-    is the total density or the density excess inside a filament, and they
-    differ by O(1) for ``dn/n ~ 1`` blobs: ``ratio_dn`` uses the excess
-    ``n - <n>`` (the quantity that actually constitutes the *turbulent* flux)
-    and ``ratio_n`` the total ``n``. Quote whichever you state.
+    Mancini et al., Plasma Phys. Control. Fusion 68, 055029 (2026), eqs. 3-5,
+    reports near-unity ratios at the outer midplane for its TCV cases. This is
+    a case-specific comparison rather than a universal expected ratio. Detection
+    bias and sparse events can make the estimate unreliable in divertor regions.
 
     Parameters
     ----------
@@ -1433,7 +1364,7 @@ def structure_size_report(blobs, r, b, b_period, verbose=True):
     ``blobs`` is the flat list of **per-frame detections** — one physical
     structure present in several frames contributes one entry per frame. That
     is the right sample for a size distribution; use :func:`track_blobs` when
-    you need distinct objects.
+    distinct objects are required.
 
     Returns a dict of medians; set ``verbose`` for the printed summary.
     """
@@ -1651,14 +1582,13 @@ def blob_velocity_regimes(Te_eV, L_par, R, delta, B=None, Ti_eV=None,
     # blobs are RB and RX, and "the sheath connected scaling significantly
     # underestimates the blob velocity").
     #
-    # FIXED 2026-10-10: the first version tested `Lambda > Theta` FIRST and so
-    # returned RB for ANY small blob, because Theta = a_hat^(5/2) -> 0. That is
-    # backwards: RB is the HIGH-collisionality, divertor-DISCONNECTED regime
-    # ("when the collisionality is sufficiently high the filaments are not
-    # electrically connected to the divertor region", Tsui 2018). A low-Lambda
-    # case is sheath-connected by construction, and the user confirmed
-    # independently that the large pure-plasma SXD run "should be in the
-    # sheath limited region" -- which the selector was contradicting.
+    # ORDER OF THE TESTS MATTERS. Test sheath connection (Lambda) BEFORE the
+    # `Lambda > Theta` comparison: RB is the HIGH-collisionality,
+    # divertor-DISCONNECTED regime ("when the collisionality is sufficiently
+    # high the filaments are not electrically connected to the divertor
+    # region", Tsui 2018), so a low-Lambda case is sheath-connected by
+    # construction. Comparing `Lambda > Theta` first returns RB for any small
+    # blob, since Theta = a_hat^(5/2) -> 0.
     #
     # Low Lambda (< 1) = connected to the target, so the Cs/Ci pair applies and
     # the split is by SIZE: the sheath current wins for large blobs, the ion
@@ -1787,28 +1717,9 @@ def resolvability_report(t, r, ixseps1, v_expected, f=None, x_slice=None,
         rep["gaussian_max"] = float(np.sqrt(2.0 * np.log(max(nsamp, 2))))
         rep["observed_max"] = float(np.nanmax(f))
 
-        # ---- decorrelation time and the EFFECTIVE sample size -------------
-        # A fine dump cadence buys tracking but NOT statistics: frames closer
-        # together than tau_c are the same realisation. The independent sample
-        # count is min(nt, span/(2 tau_c)), and it is what sets the error bar
-        # on every same-time quantity (conditional velocity, turbulent flux,
-        # spectra) -- none of which care about dt at all. So the two
-        # requirements are different and a single dt_dump trades them off:
-        #   tracking  wants  dt <~ tau_c
-        #   statistics want  span >> tau_c, i.e. MANY frames however spaced
-        # Measured on sxd_MU/from_archer_6kW: tau_c = 2.1 us, so folder 396
-        # (11 frames over 10.4 us) holds only ~2.5 independent samples and its
-        # error bars were understated ~2x, while dirs 403-408 (8 frames at
-        # 52 us) are 8 FULLY independent samples.
+        # Estimate independent samples from the time span and decorrelation time.
         if f.ndim == 3 and f.shape[0] > 2:
-            # Sample at the SEPARATRIX, not the middle of the array. `f` is
-            # already x-sliced by the caller, so locate ixseps1 inside it.
-            # Measured on from_archer_6kW/609-614 (60 frames, 1.044 us), the
-            # integral time of v_r runs 1.60 us at the separatrix to 3.48 us
-            # in the far SOL, and dn is 2-3x slower again (3.79 -> 5.42 us).
-            # `(sliced nx)//2` landed at x~153 of 244 -- far SOL -- and
-            # returned "never decorrelates in this window", i.e. N_eff = 1 of
-            # 60, when the separatrix value is N_eff = 19.
+            # Sample decorrelation at the separatrix within the supplied radial slice.
             _x0 = getattr(x_slice, "start", None) if x_slice is not None else None
             _ic = int(ixseps1) - int(_x0) if _x0 is not None else 0
             _ic = int(np.clip(_ic, 0, f.shape[1] - 1))
@@ -1915,7 +1826,7 @@ def resolvability_report(t, r, ixseps1, v_expected, f=None, x_slice=None,
                   "Frame-to-frame\n           linking connects unrelated "
                   "structures, so tracked velocities are\n           meaningless "
                   "and take either sign. Adding folders does NOT help at\n"
-                  "           this cadence — you need a SMALLER dt_dump (aim for "
+                  "           this cadence; reduce dt_dump (target "
                   "~20-50 frames\n           per SOL crossing). Use the "
                   "conditional ExB value instead.")
             _rec = (f"  SUGGESTION: set dt_dump ~ {dt_want*1e6:.2f} us "

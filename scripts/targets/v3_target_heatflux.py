@@ -14,7 +14,7 @@ The slow part is loading the guard-retaining dumps and evaluating
 target_heat_flux_density at every target — fits and plotting are cheap by
 comparison. The per-target (s_mm, q_MWm2) arrays + total power + input
 source power are pickled to ./cache/v3_target_heatflux_*.pkl. On rerun, the
-script reloads them and applies whatever you change in CONFIG below
+script reloads them and applies the current CONFIG settings below
 (fit_s_range_mm, fit_coordinate, fit_s0, …) in seconds. Set use_cache = False
 to force recomputation.
 
@@ -84,7 +84,7 @@ use_phi_gamma = True               # sheath γ: True  = φ-dependent, eqs. 12a/1
                                    #   for noisy/crash frames where φ is unreliable.
                                    # Flows to target_heat_flux_density(phi=...) in
                                    # _q_for(); it is in the cache key, so flipping
-                                   # it cannot give you a stale cached answer.
+                                   # the coordinate choice is recorded in the cache name.
 bohm_cap_v   = False               # DEPRECATED (no-op). |V_∥|≤c_s clips real
                                    # supersonic flow that sheath_boundary_simple
                                    # allows. Keep False.
@@ -105,7 +105,7 @@ target_mean = "per_snapshot"       # "per_snapshot" = plot ⟨q(P,V)⟩_t, the m
                                    #   depends on φ/T_e), so the two differ; the run
                                    #   prints by how much.
 fit_s0       = False               # strike-point shift in the fits [mm]:
-                                   #   False (default) = peak at separatrix (s0 = 0).
+                                   #   False (default) = separatrix origin (s0 = 0).
                                    #   True            = s0 added as a free fit
                                    #                     parameter — ONLY use after
                                    #                     visually confirming the
@@ -114,7 +114,7 @@ fit_s0       = False               # strike-point shift in the fits [mm]:
                                    #                     a spurious small shift that
                                    #                     artificially narrows λ_q.
                                    #   float           = fix s0 at that value [mm]
-                                   #                     (best when you know the
+                                   #                     (for a known
                                    #                     strike-point offset).
 use_cache    = True
 # ──────────────────────────────────────────────────────────────────────────────
@@ -311,7 +311,7 @@ def _compute():
         print(f"\n── Target: {tgt} ──")
         # Prefer Hermes-3's own sheath diagnostics when available — they're
         # built directly from sheath_boundary.cxx so they capture exactly what
-        # the simulation deposited, including any γ_e/γ_i corrections we don't
+        # the simulation deposited, including γ_e/γ_i contributions not
         # reproduce here. Fall back to the γ·P·V formula if absent.
         q_avg = _q_for(ds_avg, tgt, announce=True)
         s_mm, coord_label = _radial_coord(tgt, y_idx)
@@ -362,7 +362,7 @@ def _compute():
         # Flux-expansion factor at the LCFS-side SOL band: ratio of the
         # target-plate radial distance to the OMP-mapped distance for the same
         # flux surface. Eich λ_q at the target should equal f_x × Eich λ_q at
-        # the OMP — this number lets you cross-check fits done in different
+        # the OMP — this factor compares fits done in different
         # coordinate frames (e.g. target_poloidal_check.py uses target-frame s).
         _y_ref = (_mids["imp"] if (tgt.startswith("inner") and "imp" in _mids)
                   else _mids.get("omp"))
@@ -397,8 +397,17 @@ def _compute():
         src = f"P{sp}_src"
         if src in ds_avg:
             S = ds_avg[src].isel({zdim: 0}) if zdim in ds_avg[src].dims else ds_avg[src]
+            # Interior cells only. This script loads GUARD-RETAINING dumps on
+            # purpose (the plate cells are the measurement), so the y-guard
+            # rows are present here and must be dropped from a volume
+            # integral: they carry a full volume element and, on some grids,
+            # a nonzero source. Worth +0.87 % on from_archer_6kW (625.1 vs
+            # 619.7 kW), which is enough to shift a target fraction.
+            _yrows = [j for j in range(ds_avg.sizes[pdim])
+                      if j not in set(h3t.guard_rows(ds_avg))]
             P_in[sp] = float((1.5 * S * elem_vol * 2 * np.pi)
-                             .isel(x=slice(_mxg, -_mxg or None)).sum())
+                             .isel(x=slice(_mxg, -_mxg or None))
+                             .isel({pdim: _yrows}).sum())
             P_in_origin[sp] = "dump"
 
     # A species' P<sp>_src is APPLIED from the grid file by evolve_pressure
@@ -534,15 +543,7 @@ _cache_pkl = h3t.cache_path("v3_target_heatflux", dir_range,
                             "diag" if prefer_diagnostics else "nodiag",
                             f"Z{Z_ion:g}",
                             "psimid" if gridfile else "rowmid",
-                            "algn_recVi_Ve_fxv10")    # fxv10: require Ve; use transform-aware sheath alignment/reconstruction
-                                       # fxv2: f_x column;  fxv3: per-frame q_t for the ±1σ band,
-                                       # fxv4: POWER BUDGET (grid P_src + storage term),
-                                       # fxv5: Hermes-3 sheath power diagnostic,
-                                       # fxv6: total_target_power drops x-guards,
-                                       #        and the plotted mean is now
-                                       #        ⟨q(P,V)⟩ not q(⟨P⟩,⟨V⟩)
-                                       # fxv7: "omp" coordinate = TRUE midplane by ψ
-                                       #        (needs gridfile; else the old row)
+                            "algn_recVi_Ve_fxv11")    # Cache format version.
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)

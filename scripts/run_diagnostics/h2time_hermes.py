@@ -5,7 +5,7 @@ Reads and plots time-trace diagnostics from BOUT++ Hermes-3 runs.
 
 - read_h2time: handles quasi-neutral fallback, optional Nd/Td neutral species
 - sum_plt: uses time_dict, preserves t_shift stitching from prev version,
-           conditionally plots Nd/Td subplots, fixes final pickle dump bug
+           conditionally plots Nd/Td subplots
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ def read_h2time(ds: nc.Dataset, dir_name: str = "./") -> None:
     - Alternative time/z dimension names (t_array, zeta)
     - Quasi-neutral fallback: Ne derived from Ni if Ne absent
     - Te derived from Pe/Ne if Te absent
-    - Optional ion species: Ni/Ti or Nd+/Td+ 
+    - Optional ion species: Ni/Ti or Nd+/Td+
     - Optional neutral species: Nd/Td
     """
     # Resolve dimension names
@@ -145,7 +145,8 @@ def read_h2time(ds: nc.Dataset, dir_name: str = "./") -> None:
     # Per-folder guard detection: a squashed dump may or may not retain y-guards.
     # Recompute the sampling rows from THIS dump's ny so that mixing guard-retaining
     # (boutdata_guards.nc) and guardless (boutdata.nc) folders does not mislocate the
-    # OMP/IMP/target rows (the module-level y_OMP was fixed from dir_2 only).
+    # OMP/IMP/target rows. The module-level y_OMP is not usable here: it is
+    # derived from one folder and does not follow a change of guard layout.
     ny_dump   = ds.dimensions["y"].size
     ny_grid   = int(grid["SZxy"][1])
     n_targets = 2 if grid["jyseps2_1"] == grid["jyseps1_2"] else 4
@@ -303,7 +304,7 @@ elif pout_opt == "sum_load":
 elif pout_opt == "sum_plt":
     log.info("start reading...")
     time_dict: dict = {}
-    t_prev_last: float | None = None  # tracks whether we've seen a previous folder
+    t_prev_last: float | None = None  # tracks whether a previous folder contributed frames
     has_previous_history = False
     continuation_start: float | None = None
 
@@ -474,7 +475,7 @@ elif pout_opt == "sum_plt":
     plt.show()
 
     # ---------------------------------------------------------------------- #
-    # Dump (fixed: use time_dict keys, not bare variables)                   #
+    # Dump (keyed on time_dict, not on bare variables)                       #
     # ---------------------------------------------------------------------- #
     pkl.dump(
         [time_dict["t_arr"],

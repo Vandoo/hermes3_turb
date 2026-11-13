@@ -114,8 +114,7 @@ class TestTargetSheath(unittest.TestCase):
         from hermes3_turb.load import get_parallel_velocity
         from hermes3_turb.target import target_heat_flux_from_diagnostics
         root=Path(__file__).resolve().parents[1]
-        script=next(p for p in [root/'scripts/v3_target_heatflux.py',
-                                root/'scripts/targets/v3_target_heatflux.py',
+        script=next(p for p in [root/'scripts/targets/v3_target_heatflux.py',
                                 Path(__file__).with_name('v3_target_heatflux.py')] if p.exists())
         tree=ast.parse(script.read_text())
         compute=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_compute')
@@ -205,3 +204,119 @@ class TestTargetSheath(unittest.TestCase):
         self.assertGreaterEqual(checked,2)
 
 if __name__=='__main__':unittest.main()
+
+
+class TestChannelSplit(unittest.TestCase):
+    """components=True: the e/i split documented in findings_target.md."""
+
+    def _comp(self, phi=True):
+        ds = sheath_dataset()
+        out = target_heat_flux_density(
+            ds, ds.Pe, ds.Pi, ds.Ve, ds.Vi,
+            phi=ds.phi if phi else None, target='outer_lower',
+            bohm_cap_v=False, components=True)
+        self.assertEqual(len(out), 4)
+        return ds, out
+
+    def test_default_return_is_unchanged(self):
+        ds = sheath_dataset()
+        out = target_heat_flux_density(ds, ds.Pe, ds.Pi, ds.Ve, ds.Vi,
+                                       phi=ds.phi, target='outer_lower',
+                                       bohm_cap_v=False)
+        self.assertEqual(len(out), 3)
+
+    def test_channels_sum_to_the_total(self):
+        _, (q_local, q_avg, _, c) = self._comp()
+        np.testing.assert_allclose(
+            (c['q_e'] + c['q_i']).values, q_local.values, rtol=0, atol=0)
+        np.testing.assert_allclose(
+            (c['q_e_avg'] + c['q_i_avg']).values, q_avg.values, rtol=1e-12)
+        np.testing.assert_allclose(
+            c['q_e_frac'].values, (c['q_e_avg'] / q_avg).values, rtol=1e-12)
+
+    def test_gamma_e_is_the_dudson_form_and_pv_divides_it_out(self):
+        # phi=60 V, Te=20 eV -> gamma_e = 2 + 60/20 = 5 exactly.
+        _, (_, _, _, c) = self._comp()
+        np.testing.assert_allclose(c['gamma_e'].values, 5.0, rtol=1e-12)
+        np.testing.assert_allclose(c['phi_over_Te'].values, 3.0, rtol=1e-12)
+        # q_e = gamma_e * pv_e, so pv_* really is the channel without gamma.
+        np.testing.assert_allclose(
+            (c['gamma_e'] * c['pv_e']).values, c['q_e'].values, rtol=1e-12)
+        np.testing.assert_allclose(
+            (c['gamma_i'] * c['pv_i']).values, c['q_i'].values, rtol=1e-12)
+
+    def test_plate_plasma_profiles_are_returned(self):
+        """Ne/Ni/Te/Ti at the plate, for the profile plots."""
+        _, (_, _, _, c) = self._comp()
+        for k in ("Ne", "Ni", "Te_eV", "Ti_eV",
+                  "Ne_avg", "Ni_avg", "Te_eV_avg", "Ti_eV_avg"):
+            self.assertIn(k, c)
+            self.assertIsInstance(c[k], xr.DataArray)
+        # the fixture sets Te=20 eV, Ti=10 eV, Ne=Ni=1e19 everywhere
+        np.testing.assert_allclose(c["Te_eV"].values, 20.0, rtol=1e-12)
+        np.testing.assert_allclose(c["Ti_eV"].values, 10.0, rtol=1e-12)
+        np.testing.assert_allclose(c["Ne"].values, 1e19, rtol=1e-12)
+        np.testing.assert_allclose(c["Ni"].values, 1e19, rtol=1e-12)
+
+    def test_plate_density_is_at_the_sheath_not_the_domain_cell(self):
+        """0.5*(domain+guard), the same cells q uses — a density that varies
+        across the plate would otherwise be read half a cell upstream."""
+        ds = sheath_dataset()
+        domain, guard = get_target_boundaries(ds)[0]["outer_lower"]
+        ds["Ne"].values[:, :, domain, :] = 2e19
+        ds["Ne"].values[:, :, guard, :] = 4e19          # sheath value 3e19
+        _, _, _, c = target_heat_flux_density(
+            ds, ds.Pe, ds.Pi, ds.Ve, ds.Vi, phi=ds.phi,
+            target="outer_lower", bohm_cap_v=False, components=True)
+        np.testing.assert_allclose(c["Ne"].values, 3e19, rtol=1e-12)
+
+    def test_density_falls_back_to_P_over_eT_without_a_dumped_N(self):
+        ds = sheath_dataset().drop_vars(["Ne", "Ni"])
+        _, _, _, c = target_heat_flux_density(
+            ds, ds.Pe, ds.Pi, ds.Ve, ds.Vi, phi=ds.phi,
+            target="outer_lower", bohm_cap_v=False, components=True)
+        np.testing.assert_allclose(
+            c["Ne"].values, (c["Pe"] / (QE * c["Te_eV"])).values, rtol=1e-12)
+        np.testing.assert_allclose(
+            c["Ni"].values, (c["Pi"] / (QE * c["Ti_eV"])).values, rtol=1e-12)
+
+    def test_the_standalone_script_consumes_them(self):
+        """`target_profiles.py` is the only consumer, by design: the heat-flux
+        scripts are left alone so nothing has to be re-run to get profiles."""
+        root = Path(__file__).resolve().parents[1] / "scripts/targets"
+        tp = (root / "target_profiles.py").read_text()
+        for key in ('comp["Ne_avg"]', 'comp["Ni_avg"]',
+                    'comp["Te_eV_avg"]', 'comp["Ti_eV_avg"]'):
+            self.assertIn(key, tp)
+        self.assertIn("components=True", tp)
+        # and it must NOT have been bolted onto the heat-flux machinery
+        for name in ("target_heatflux.py", "v3_target_heatflux.py",
+                     "compare_target_profiles.py"):
+            src = (root / name).read_text()
+            self.assertNotIn("Ne_avg", src, f"{name} should not carry profiles")
+
+    def test_fixed_gamma_fallback_still_returns_arrays(self):
+        _, (_, _, _, c) = self._comp(phi=False)
+        for key in ('gamma_e', 'gamma_i'):
+            self.assertIsInstance(c[key], xr.DataArray)
+            np.testing.assert_allclose(c[key].values, 3.5, rtol=1e-12)
+        self.assertIsNone(c['phi'])
+        self.assertIsNone(c['phi_over_Te'])
+
+    def test_mean_gamma_cannot_rebuild_the_mean_flux(self):
+        # Documented trap: <gamma>.<P.V> != <gamma.P.V>. Here gamma and the
+        # fields are uniform in z so they DO agree - the point of the test is
+        # that the code never relies on it: q_*_avg is the mean of the product.
+        _, (_, _, _, c) = self._comp()
+        np.testing.assert_allclose(
+            c['q_e_avg'].values,
+            (c['gamma_e'] * c['pv_e']).mean(dim='z').values, rtol=1e-12)
+
+    def test_script_exposes_the_split_flag(self):
+        src = (Path(__file__).resolve().parents[1]
+               / 'scripts/targets' / 'target_heatflux.py').read_text()
+        tree = ast.parse(src)
+        flags = [t.id for n in tree.body if isinstance(n, ast.Assign)
+                 for t in n.targets if isinstance(t, ast.Name)]
+        self.assertIn('split_species', flags)
+        self.assertIn('components=True', src)

@@ -7,7 +7,7 @@ where things sit on the poloidal (R, Z) plane.
 Three parts:
 
   A. SOURCE COMPARISON  - external gas puff vs target recycling vs wall
-                          recycling vs pump vs net ionisation. Tells you what
+                          recycling vs pump vs net ionisation. Reports what
                           actually fuels the plasma (usually recycling, not the
                           puff).
   B. REACTION/RADIATION AUDIT - volume-integrate every R*/E*/S* diagnostic,
@@ -25,7 +25,7 @@ Design notes
 ------------
 * The dump is opened ONCE (open_dataset) and the single dataset is passed to
   every part. Opening the same multi-GB file twice (e.g. netCDF4 + xbout) can
-  segfault via clashing HDF5 handles - so we never do that.
+  segfault via clashing HDF5 handles - so those handles are not mixed.
 * open_dataset prefers xhermes (geometry -> .bout accessor works), falls back to
   xbout, and finally to a plain xarray open (A/B still work; C is skipped with a
   message because it needs the toroidal geometry).
@@ -173,23 +173,22 @@ def geometry(ds, cfg):
     # y-boundary guards are present only if the loaded poloidal size exceeds the
     # no-boundary global ny (BOUT convention: metadata 'ny' excludes y-guards,
     # while 'nx' includes x-guards). With keep_yboundaries=False there are none,
-    # so we must NOT carve target/X-point cells out of the domain.
+    # so no need to carve target/X-point cells out of the domain.
     ny_nogc = int(meta(ds, "ny", ny))
     gy = MYG if ny > ny_nogc else 0
     geo.update(MXG=MXG, MYG=MYG, ny_inner=ny_inner, gy=gy,
                ixseps1=ixseps1, double_null=double_null)
 
     # ── Midplane rows from the TOPOLOGY, never from argmax(R) ────────────────
-    # This used to be `yidx[argmax(Rsep[yidx])]`, i.e. the poloidal row of
-    # largest major radius on the separatrix. That is wrong on MAST-U:
-    # `valid_y` excludes only the guard rows, so the search spans the divertor
-    # legs and the X-point regions, where a Super-X reaches a LARGER R than the
-    # outboard midplane does. Measured on the SXD nx244 grid it returned
-    # theta=46 at R=1.4293, Z=+1.9713 m — essentially the top of the machine —
-    # against the true OMP at theta=81, R=1.3821, Z=+0.0599 m.
-    # Same region offsets as target.get_midplane_y_indices (A: +g, B: +3g);
-    # dropping the +3*g is the recurring bug in this codebase (see the `ddy`
-    # mis-registration and the v3_radial_flux lambda-arc offset).
+    # `yidx[argmax(Rsep[yidx])]` — the row of largest major radius on the
+    # separatrix — does NOT find the OMP on MAST-U: a search that spans the
+    # divertor legs and the X-point regions (as it does when `valid_y`
+    # excludes only the guard rows) hits a Super-X leg, which reaches a LARGER
+    # R than the outboard midplane. On the SXD nx244 grid that gives theta=46
+    # at R=1.4293, Z=+1.9713 m — essentially the top of the machine — against
+    # the true OMP at theta=81, R=1.3821, Z=+0.0599 m.
+    # Same region offsets as target.get_midplane_y_indices (A: +g, B: +3g).
+    # The +3*g on region B is required: dropping it mis-registers the row.
     y_omp = (j1_2 + 3 * gy + j2_2 + 3 * gy) // 2
     y_imp = (j1_1 + gy + j2_1 + gy) // 2 if double_null else None
     geo.update(y_omp=y_omp, y_imp=y_imp)

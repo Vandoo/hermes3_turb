@@ -1,39 +1,16 @@
 #!/usr/bin/env python3
-"""
-Poloidal flux expansion f_x of a BOUT++ grid, per divertor leg.
+"""Compute poloidal flux expansion along each divertor leg.
 
-Needed for `blobs.blob_velocity_regimes`: Tsui et al 2018 (PoP 25, 072506)
-eq. (1.5) sets the field-line fanning parameter `eps_x ~ 1/f_x_max` from "the
-maximum POLOIDAL flux expansion typically found for those shapes WHEN
-AVERAGED ACROSS THE SOL", and quotes ~0.3 for diverted / ~0.5 for limited
-plasmas. In the Ci (connected ideal-interchange) regime eps_x multiplies the
-blob velocity envelope directly, so for a Super-X it is not a detail.
+    f_x(theta) = (R Bp)_upstream / (R Bp)(theta)
 
-f_x = (R Bp)_upstream / (R Bp)(theta), because dpsi = R Bp dr_perp so the
-perpendicular spacing of flux surfaces goes as 1/(R Bp). And **sqrt(g11) is
-R*Bp exactly** in the BOUT++ tokamak metric -- verified here against the
-independent route R = sqrt(g_33), Bp = B*sqrt(1 - g_23^2/(g_22 g_33)), which
-agrees to 1e-6 -- so this needs only the DUMP, no grid file and no geometry.
+For the BOUT++ tokamak metric, sqrt(g11) = R Bp. The calculation uses that
+metric from the dump and reports target expansion, the maximum along the
+leg, and parallel leg length. Target and X-point maxima are distinct: the
+latter depends on resolution near Bp=0.
 
-TWO NUMBERS, AND ONLY ONE OF THEM IS TSUI'S. `R Bp -> 0` at the X-point, so
-the maximum ANYWHERE along a leg diverges and is set by how finely the grid
-resolves the X-point cell (7.94 on the nx244 SXD mesh). That is not what
-eps_x ~ 0.3 can mean. Use the value **at the target** -- the standard
-divertor-community "flux expansion", and the one that reproduces Tsui's
-reference magnitude.
-
-Measured on sxd_MU/from_archer_6kW (nx244, connected double null, up-down
-symmetric to 1.3e-6):
-    outer targets  f_x = 4.64 SOL-averaged (5.47 at the separatrix)  -> eps_x 0.216
-    inner targets  f_x = 3.56                                        -> eps_x 0.281
-    4-leg mean     f_x = 4.10                                        -> eps_x 0.244
-    X-point max    f_x = 7.94  <- grid-dependent, NOT eps_x
-The separatrix 5.47 independently reproduces the f_x ~ 5.5 measured in the
-lambda_q work from the OMP-mapped cell widths.
-
-NB `jyseps*` are the INCLUSIVE last index of the preceding band, so they need
-`+1` when used as a slice END as well as as a slice start. Getting that wrong
-gave legs of 19 and 20 rows and made a symmetric grid look asymmetric.
+Tsui et al. 2018, Phys. Plasmas 25, 072506, motivates the field-line fanning
+parameter used in blob-velocity estimates. jyseps* indices are inclusive;
+half-open Python region slices include the endpoint with +1.
 """
 import numpy as np
 from netCDF4 import Dataset

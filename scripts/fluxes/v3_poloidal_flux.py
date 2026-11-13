@@ -102,40 +102,17 @@ def _compute():
     zdim = h3t.detect_toroidal_dim(ds)
     pdim = h3t.detect_poloidal_dim(ds)
 
-    # ── Drop y-boundary guard rows if the load kept them ──────────────────────
-    # xBOUT honours the GRID's `y_boundary_guards`, so a grid built with
-    # y_boundary_guards=2 returns a guard-retaining dataset even when this
-    # script asks for keep_yboundaries=False. That is not merely untidy:
-    # `.bout.ddy()` returns only the domain rows but RE-LABELS them onto the
-    # FIRST n_domain theta values rather than the domain rows' own labels.
-    # xarray then inner-joins on those labels inside `ExB_radial_velocity`, so
-    # each domain cell's ∂φ/∂θ is paired with the ∂φ/∂ζ and metric of a
-    # *different* cell — offset by the guards, and wrong everywhere past the
-    # first guard pair, not just at the ends.
-    # Visible symptom: Fig 1 dies in pcolormesh with
-    #   Dimensions of C (244, 112) should be one smaller than X(120)
-    # Invisible symptom: a mis-registered ExB flux, plus `Gamma_mag_*` left on
-    # the full 120 axis (load_grid_vars pads to the dataset) and `j1/j2`
-    # computed for the guarded layout — so the θ-band of every 1-D profile is
-    # taken from the wrong rows.
-    # Measured on from_archer_6kW/data/396 (grid ny=112, MYG=2 → 120 rows):
-    # ddy returns theta == full[:112] exactly, confirming the re-labelling.
-    # Guard layout is this codebase's usual one: region A at +MYG, B at +3·MYG.
+    # Remove retained y-guards before poloidal derivatives.
+    # xBOUT derivative coordinates require the interior poloidal layout.
     import netCDF4 as _nc_g
     with _nc_g.Dataset(gridfile) as _g0:
         _ny_g = int(_g0["ny"][:])
-    _MYG0 = int(ds.metadata.get("MYG", 2))
-    _nyi0 = int(ds.metadata.get("ny_inner", 0) or 0)
+    # The guard count per band is derived from the dump (npol - ny), NOT from
+    # MYG: a grid with y_boundary_guards=1 gives ny+4 rows while MYG reports
+    # 2, so a `npol == ny + 4*MYG` test matches neither layout and strips
+    # nothing. One implementation, in h3t.guard_rows.
     _npol = ds.sizes[pdim]
-    if _nyi0 > 0 and _npol == _ny_g + 4 * _MYG0:            # double null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_nyi0 + _MYG0, _nyi0 + 3 * _MYG0))
-                       + list(range(_ny_g + 3 * _MYG0, _ny_g + 4 * _MYG0)))
-    elif _npol == _ny_g + 2 * _MYG0:                        # single null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_ny_g + _MYG0, _ny_g + 2 * _MYG0)))
-    else:
-        _guard_rows = []
+    _guard_rows = h3t.guard_rows(ds, ny_grid=_ny_g)
     if _guard_rows:
         _keep_rows = [i for i in range(_npol) if i not in set(_guard_rows)]
         print(f"  dataset kept y-guards despite keep_yguards={keep_yguards} "
@@ -214,8 +191,11 @@ def _compute():
 
     F_par_pol = tmean(zmean(n * v_par_pol))
     F_ExB_pol = tmean(zmean(n * v_ExB_pol))
+    # 5/2 for the PARALLEL advective flow (evolve_pressure.cxx:307), 3/2 for
+    # the perpendicular ExB flow (:270 advects P with a plain divergence).
+    # See h3t.EXB_ENERGY_COEFF — the coefficient is channel-dependent.
     Q_par_pol = tmean(zmean(2.5 * P * v_par_pol))
-    Q_ExB_pol = tmean(zmean(2.5 * P * v_ExB_pol))
+    Q_ExB_pol = tmean(zmean(h3t.EXB_ENERGY_COEFF * P * v_ExB_pol))
 
     Gmag_pol_e, Gmag_pol_i = h3t.poloidal_magnetic_drift_particle_flux(
         ds, Ne, Ni, bxcvx, bxcvy, Bxy, Te_eV, Ti_eV)
@@ -226,7 +206,7 @@ def _compute():
 
     # ── Parallel conduction ──────────────────────────────────────────────────
     # Manual centered FD on the field-aligned T (matches the pattern used in
-    # target_poloidal_check.py). We can't use `T.bout.ddy()` here because
+    # target_poloidal_check.py). `T.bout.ddy()` is unsuitable here because
     # without geometry="toroidal" applied at load, the bout accessor's
     # field-aligned check (`direction_y != "Aligned"`) raises. So shift T
     # explicitly via h3t.to_field_aligned (FFT-based, geometry-independent)
@@ -311,8 +291,7 @@ def _compute():
 
 # ── Cache load or compute ────────────────────────────────────────────────────
 _cache_pkl = h3t.cache_path("v3_poloidal_flux_d2g", dir_range, species,
-                            "t2")
-                                    # t2: Te/Ti NaN frames filled from P/N
+                            "t3")   # Cache format version.
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)

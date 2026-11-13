@@ -14,7 +14,9 @@ def profile_times(cache, path, expected_frames=None):
     refused rather than inferring duration from a nominal dump interval.
     """
     try:
-        if "t_s" in cache:
+        # An empty t_s (older fxv8 caches whose stored-energy step failed)
+        # counts as missing, so it falls through to squash recovery.
+        if "t_s" in cache and np.size(cache["t_s"]):
             times = np.asarray(cache["t_s"], dtype=float)
         else:
             import netCDF4 as nc

@@ -1,101 +1,27 @@
 #!/usr/bin/env python3
-"""
-Interpolate a Hermes-3 run onto a finer grid and write new restart files.
+"""Interpolate or coarsen a Hermes-3 run and write restart files.
 
-Consolidates the four ad-hoc scripts that did this (`interpolatex_dmp_hm.py`,
-`interpolatey_dmp_hm.py`, `interpolatey_dmp_hm_yguards.py`,
-`copy_restart_hermes.py`) into one driver with a CONFIG block and a single
-`mode`, in the style of the other scripts here.
+Configure paths and select one mode in the CONFIG block. Run mode='check'
+first to inspect topology, region boundaries, and array dimensions.
 
-The workflow
-------------
-Refining a run is a four-step job, and each step is a `mode` below:
+Workflow
+--------
+1. Squash the source run with boutdata.squashoutput.
+2. Generate a destination-grid output and copy it to boutdata_write.nc.
+   Source and destination files must be distinct.
+3. Use interp_y or interp_x to refine, or coarsen_x to reduce radial resolution.
+4. Use check_result to compare source and destination inventories, then
+   to_restart to write files with the destination nxpe/nype decomposition.
 
-  1. Squash the old run                       -> `<src>/boutdata.nc`
-     (`squash_hermes.py`, or `boutdata.squashoutput` directly)
-  2. Run the NEW grid for one output step and squash it. That gives a dataset
-     of the right shape to write into — copy it to `<dst>/boutdata_write.nc`,
-     which is what this script fills. **The template is never the file you
-     read**, so a half-finished run cannot corrupt your source.
-  3. `mode='interp_y'` and/or `'interp_x'` — interpolate old -> template.
-     To go the other way (a cheaper grid for a neutrals run) use
-     `mode='coarsen_x'`, one halving per run: 256 -> 128 -> 64.
-  4. `mode='to_restart'` — write `BOUT.restart.*` from the filled template.
+Poloidal interpolation operates within each topological region in field-aligned
+coordinates. Radial interpolation uses raw poloidal flux per column.
+coarsen_x computes volume-weighted averages over overlapping flux cells;
+interp_z resizes the periodic Fourier spectrum directly in restart files.
 
-`mode='check'` reports the topology, region map and index ranges without
-touching anything; run it first.
-
-How the interpolation works
----------------------------
-**Poloidal (`interp_y`).** Done **region by region** (`ds.regions`), because a
-single global interpolation would smear across the X-point branch cuts where
-the poloidal index is discontinuous. Within a region the data is first put
-into **field-aligned** coordinates (`to_field_aligned`), so the interpolation
-follows field lines rather than cutting across them, then a `CubicSpline` in
-normalised poloidal index maps old to new, then `from_field_aligned` undoes
-the shift before writing. Two guard cells are taken on the source
-(`with_guards=2`) so the spline has support at the region ends.
-
-**Radial, refining (`interp_x`).** A `CubicSpline` in normalised poloidal flux
-`ψ_n = (ψ − ψ_axis)/(ψ_bdry − ψ_axis)`, per poloidal column, so flux surfaces
-map to flux surfaces even when the two grids pack cells differently.
-
-**Radial, coarsening (`coarsen_x`).** Going the other way — 256 → 128 → 64, to
-make a neutrals run affordable — is *not* the same operation with a different
-target. Sampling a spline at fewer points aliases: everything above the new
-Nyquist folds back into the resolved band instead of being removed, and a
-cubic can overshoot outside the range of its data. Measured on the SXD
-`flutter_111` case at 2:1, the spline overshoots the source maximum of `Ne` by
-**1.8 %** — an extremum that was not in the data — and differs from the
-conservative answer by 0.4 % of mean `Ne`, most of it cell-to-cell, i.e. the
-aliased part.
-
-So `coarsen_x` does a **volume-weighted average over cell overlaps in ψ**:
-each destination cell takes `Σ f_i·J_i·Δψ_i / Σ J_i·Δψ_i` over the source
-cells it covers. That is a box filter (it removes the sub-grid scales rather
-than folding them in), it is bounded by the source values (so `positive_vars`
-never needs the `abs()` clamp that spline overshoot forces), and it conserves
-the column integral to machine precision — measured `-0.0000 %` against the
-spline's `-0.0011 %`. It handles non-nested grids and the strongly non-uniform
-radial packing these meshes use (`dψ` varies 15× across the SXD grid), because
-the overlap is computed in ψ rather than by index.
-
-Cell **edges** come from `dx`, which is exactly the ψ width of a cell: rebuilt
-edges reproduce `psixy` to 3e-12 relative, and `coarsen_x` verifies that on
-every column before using it.
-
-`uniform_theta=False` switches the poloidal coordinate from index to true
-parallel arc length `∫dy·√g_22`, which matters when the two grids have
-different poloidal packing rather than a uniform refinement.
-
-What changed from the original scripts
---------------------------------------
-* **The region → array-index map is derived, not hard-coded.** The originals
-  carried a `y_beg`/`y_end`/`xN_beg`/`xO_beg` table written out by hand for a
-  connected double null, with a magic `xO_beg['SOL'] = 2`. Here the
-  destination slice is recovered by matching each region's own coordinate
-  values back into the full array (`np.searchsorted`), which is topology-
-  independent and cannot silently drift if the grid changes.
-* **One `mode`.** `interpolatey_dmp_hm_yguards.py` had four consecutive
-  `opt_ = ...` lines, so only the last ever took effect.
-* **`import sys`** — the originals call `sys.exit()` on every error path
-  without importing it, turning a clear message into a `NameError`.
-* **`correct_MYG_squash` is fixed.** The copy in `interpolatex_dmp_hm.py`
-  assigned `dsN1` then read `ds`, so it raised `NameError` whenever the MYG
-  fix-up was actually needed.
-* **Conservation check.** `mode='check_result'` compares volume-integrated
-  Ne / Pe / Pi between source and refined dataset. Interpolation is not
-  conservative, but a few-percent change is expected and a large one means
-  something is wrong (usually a mismatched region or a bad ψ mapping).
-
-Caveats
--------
-* **`interp_x`/`interp_y` do not conserve** — expect small changes in total
-  particles and energy, and a transient when the refined run starts. Cubic
-  splines overshoot at steep gradients, so positive-definite variables are
-  clamped with `abs()` (the originals did this too), which is a blunt fix.
-  `coarsen_x` has neither problem: it conserves exactly and is bounded.
-* `to_restart` needs `nxpe`/`nype` matching the new run's decomposition.
+Radial and poloidal spline interpolation can change particle and energy
+inventories and overshoot at steep gradients. Positive variables are clamped
+with abs(). Coarsening is conservative and bounded by source values.
+uniform_theta=False uses parallel arc length instead of poloidal index.
 """
 
 import os
@@ -172,12 +98,7 @@ variables = ["Ne", "Ni", "Ve", "Vi", "NVe", "NVi", "Te", "Ti",
 #    "Nd","NVd","Pd","Td","Vd", "Vort","phi"]
 positive_vars = ("Ne", "Ni", "Te", "Ti", "Pe", "Pi")   # clamped with abs()
 
-allow_file_fixup = False # let the script WRITE a corrected MYG into a squashed
-                         # dump. Off by default: it modifies a file you think of
-                         # as read-only, and if the guard inference is wrong it
-                         # corrupts the metadata of good data. Left off, the
-                         # script reports what it would change and carries the
-                         # right value in memory instead.
+allow_file_fixup = False # allow MYG metadata writes; otherwise use the inferred value in memory
 dry_run = False           # interp_*: do everything EXCEPT the write, and report
                          # per-region shapes/ranges. Always run this first —
                          # the write modifies dst_write in place.
@@ -194,7 +115,7 @@ copy_from, copy_to = "./1/", "./to_restart/"           # for 'copy_restart'
 
 
 def find_file(pattern, path):
-    """First file matching `pattern` at or below `path` (the originals' helper)."""
+    """Return the first file matching pattern at or below path."""
     for root, _dirs, files in os.walk(path):
         for name in files:
             if fnmatch.fnmatch(name, pattern):
@@ -219,17 +140,10 @@ def dump_has_yguards(datafile, grid_ny):
 
 
 def fix_squash_myg(datafile, MYG, allow_write=False):
-    """Report — and optionally correct — a wrong `MYG` in a squashed dump.
+    """Report a mismatch between the squash MYG value and the inferred guard layout.
 
-    `boutdata.squashoutput` can stamp an `MYG` that disagrees with the grid,
-    which makes xBOUT mis-slice the poloidal regions. The originals rewrote the
-    file unconditionally; that is a write to something the user reasonably
-    treats as read-only, and if the guard inference is wrong it corrupts good
-    metadata. So this only reports unless `allow_write=True`.
-
-    (Fixed version of the originals' `correct_MYG_squash` — the copy in
-    `interpolatex_dmp_hm.py` opened the file as `dsN1` but read `ds`, so it
-    raised `NameError` exactly when it was needed.)
+    The supplied MYG is used in memory. The file is modified only when
+    allow_write=True; inconsistent metadata can affect xBOUT region slicing.
     """
     try:
         with nc.Dataset(datafile, "r") as d:
@@ -268,35 +182,13 @@ def _is_vlen_str(v):
 
 
 def interpft_z(arr, nz_new, axis=-1):
-    """Spectral interpolation along the periodic toroidal axis. EXACT.
+    """Resize a uniformly spaced periodic axis by Fourier interpolation.
 
-    Zero-padding the rfft spectrum *is* band-limited interpolation for a
-    periodic, uniformly spaced axis: every mode the source resolves is
-    reproduced exactly and nothing is invented.  So unlike the radial
-    direction, z needs no conservative-averaging path -- mode 0 is untouched,
-    so the z-average (hence every volume integral) is preserved to round-off
-    in BOTH directions, refining and coarsening.  Coarsening is then the exact
-    low-pass rather than the aliasing mess that sampling a spline downwards is
-    in x.
-
-    Verified for `27 -> 81` (the MZ refinement this exists for): since
-    `81 = 3*27` and both grids start at z=0, every 3rd fine point coincides
-    with a source point, and the interpolant reproduces the source there to
-    3.6e-15; the z-mean holds to 1.3e-15, the 27->81->27 round trip to 5.3e-15
-    and the rms ratio is 1.000000.
-
-    THREE BUGS in STORM's `interpft_dbZ` (`Storm/drsep0_scripts/copy_restart.py`,
-    where the call site is also commented out, so it was never exercised) --
-    all three bite on 27 -> 81:
-      * numpy's `irfft` divides by its OUTPUT length, so the spectrum must be
-        scaled by `nz_new/nz_old`.  The hard-coded `*2.0` is right only for
-        doubling; 27 -> 81 needs 3.0, so every field came out at ~2/3.
-      * `irfft` must be given `n=nz_new`.  Its default is `2*(m-1)`, which for
-        an ODD target returns `nz_new - 1` points -- 80 instead of 81.
-      * if `nz_old` is EVEN its last rfft bin is the Nyquist mode, counted once
-        there but twice as an interior mode of the longer transform, so it must
-        be halved when padding (and doubled when truncating onto a new even
-        Nyquist).  A no-op for odd -> odd, wrong in general without it.
+    Zero-padding refines the resolved spectrum; truncation applies a low-pass
+    filter when coarsening. The zero mode, and therefore the toroidal mean,
+    is preserved. The inverse transform uses the requested output length and
+    the nz_new/nz_old amplitude scaling. Even-length Nyquist modes are split
+    when padding and combined when truncating.
     """
     a = np.moveaxis(np.asarray(arr, dtype=float), axis, -1)
     nz_old = a.shape[-1]
@@ -469,13 +361,10 @@ def grid_topology(gridfile):
 
 
 def region_slices(ds, sub):
-    """Index ranges of a `from_region` sub-array inside the full array.
+    """Find a region sub-array's index ranges within the full coordinate arrays.
 
-    Replaces the hand-written per-region index table in the originals. Each
-    region carries its own `x`/`theta` coordinate values, so matching them back
-    into the full coordinate arrays recovers the slice for any topology.
-    Raises if the result is not contiguous, which would mean the region
-    selection and the full array disagree.
+    Coordinates are matched with searchsorted. Noncontiguous matches raise
+    an error because they cannot be represented by one destination slice.
     """
     out = {}
     for dim in ("x", "theta"):
@@ -489,22 +378,12 @@ def region_slices(ds, sub):
 
 
 def write_band(region, xs, ixseps1):
-    """Trim a region's x range to the band it actually owns.
+    """Restrict a region's radial range to cells owned by that region.
 
-    `from_region` returns MXG x-guard cells on the side facing the separatrix,
-    so neighbouring regions OVERLAP: on the example case the core/PFR regions
-    span x 0:68 and the SOL regions x 64:132, both 68 wide, while the
-    separatrix is at 66. Writing both in full would let whichever is processed
-    last overwrite two cells belonging to the other — silently corrupting two
-    radial cells either side of the separatrix.
-
-    Each destination cell must therefore be written exactly once: core/PFR own
-    `x < ixseps1`, SOL owns `x >= ixseps1`. The originals encoded this as a
-    hand-written table with a magic `xO_beg['SOL'] = 2`; deriving it from
-    `ixseps1` reproduces that table exactly and survives a change of grid.
-
-    Returns `(lo, hi, sub_lo, sub_hi)` — the destination range and the matching
-    slice of the region sub-array.
+    from_region can include overlapping x-guards at the separatrix. Core/PFR
+    regions own x < ixseps1 and SOL regions own x >= ixseps1, ensuring each
+    destination cell is written once. Returns (lo, hi, sub_lo, sub_hi) for the
+    destination range and the matching sub-array range.
     """
     if region.endswith("SOL"):
         lo, hi = max(xs.start, ixseps1), xs.stop
@@ -574,11 +453,7 @@ if _needs_grid:
         sys.exit(f"could not find grids (src={src_grid}, dst={dst_grid}) — set them in CONFIG")
 
 def preflight(t_src, t_dst, src_file, dst_file, write_file, mode):
-    """Say what this refinement needs before doing any work.
-
-    Reactive errors ("file missing") arrive after you have already waited for a
-    multi-GB load. This states the plan, the prerequisites and the next step
-    up front.
+    """Check required input files, paths, and grid compatibility before interpolation.
     """
     notes, blockers = [], []
     dx = t_src["nx"] != t_dst["nx"]
@@ -734,7 +609,7 @@ if mode in ("interp_y", "interp_x", "check", "check_result"):
             sys.exit(
                 f"{tag}: {os.path.basename(f)} has {ny_dump} poloidal rows (y-guards) "
                 f"but grid {os.path.basename(g)} has ny={ny_grid} (none).\n"
-                f"  FIX: interpolate the GUARDLESS squashes, the guard files come later:\n"
+                f"  Use guardless squashes for interpolation; transfer guard values afterwards:\n"
                 f"         src_data = dst_data = 'boutdata.nc'\n"
                 f"         dst_write = 'boutdata_write.nc'   (fresh cp of dst boutdata.nc)\n"
                 f"       then mode='add_yguards' (uses src_guard_data/dst_guard_data),\n"
@@ -930,8 +805,8 @@ elif mode == "interp_x":
         the radial domain: ~1 cell on 132, several near the separatrix where the
         packing is 15x finer) while their RAW spans are identical. The SXD
         132/244 pair differs only at 2e-7. Being pair-dependent is exactly why
-        the raw coordinate is the one to use. `coarsen_x` already worked in raw
-        psi; `interp_x` did not until 2026-10-13.
+        the raw coordinate is the one to use. Both `coarsen_x` and
+        `interp_x` work in raw psi.
         """
         with nc.Dataset(gridfile) as f:
             return (np.asarray(f["psixy"][:]),
@@ -1060,12 +935,7 @@ elif mode == "coarsen_x":
         print(f"  poloidal rows: grid {ny}, source dump {ny_src_dump}, "
               f"target dump {ny_dst_dump}")
     dom_dst = domain_row_for_grid_row(ny, ny_dst_dump, myg_d, nyi_d)
-    # When both dumps share a layout, pair rows DIRECTLY. Routing through the
-    # grid rows instead would refill the target's guards from the neighbouring
-    # domain row and throw away the guard values the source actually holds —
-    # measured on the nn_cd pair as Ve max 2.3152 -> 3.6e-4, i.e. the sheath
-    # velocities deleted. Note the integral check does not see this (it sums
-    # over grid rows only); the mean/max columns are what expose it.
+    # Pair matching guarded layouts directly to preserve source target values.
     src_row_for_dst = (np.arange(ny_dst_dump) if ny_src_dump == ny_dst_dump
                        else dom_src[row_dst])
     if ny_dst_dump > ny:
@@ -1203,14 +1073,12 @@ elif mode in ("add_yguards", "sheath"):
     #    to Field3D (8, 8, 27)".
     # So the interpolated interior goes into a guard-retaining copy of the NEW
     # run, and the guard rows come from the OLD run's guard-retaining squash
-    # (the sheath values, which the originals copied across too) — or, when no
+    # (the saved sheath values) — or, when no
     # such squash exists or its x/z shape differs (after interp_x/coarsen_x),
     # a zero-gradient copy of the adjacent interpolated row. Hermes-3 resets
     # these rows from the sheath condition on the first RHS call, so they only
     # have to be finite and sensible, not exact.
     #
-    # The old 'sheath' mode copied the guards but never moved the interior
-    # in, so the restart either lacked guards or held the template's state.
     interior_file = write_file
     tmpl_file = os.path.join(dst_dir, dst_guard_data)
     out_file = os.path.join(dst_dir, dst_guard_write)
@@ -1441,9 +1309,7 @@ elif mode == "interp_z":
           f"   ({mz_new / nz_old:g}x)")
     print("  stored metadata: "
           + ", ".join(f"{k}={v}" for k, v in meta.items() if v is not None))
-    # The MZ-vs-nz convention CHANGED in BOUT++ history: `nz` used to be stored
-    # as `MZ` with MZ = nz + 1 (see xbout/load.py:414).  So preserve whatever
-    # relation THIS file uses rather than assuming MZ == nz.
+    # Preserve the file's MZ/nz convention: some formats store MZ = nz + 1.
     offsets = {k: (meta[k] - nz_old) for k in ("nz", "MZ", "MZSUB")
                if meta[k] is not None}
     new_meta = {k: mz_new + off for k, off in offsets.items()}

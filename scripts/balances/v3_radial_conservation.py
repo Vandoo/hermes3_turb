@@ -12,8 +12,9 @@ For each radial index x, plot two profiles:
                                                   the flux surface at x
                                                   (full torus)
 
-In steady state with Neumann at the radial walls and **no other sinks in the
-volume V(x)**, these are equal:    F_in(x)  =  F_out(x)
+F_in uses the PRESCRIBED source `P<sp>_src`, so it is the input power. It is
+NOT the quantity that balances the radial flux, and the two curves are not
+expected to coincide — see the identity below.
 
 For x < ixseps1 this is the **clean balance** — agreement of the two curves is
 the conservation closure — **but only on the between-X-point θ band**
@@ -27,10 +28,27 @@ parallel power deposited on the plates between the LCFS and radial position
 x.  The two curves separating at x = ixseps1 is the classical "LCFS power
 crossing" reading.
 
-Includes ExB + magnetic-drift + anomalous + (optional) flutter on the
-radial side, matching the v3_plasma_balance flux model.  Source uses
-S_e/S_i_src for particles and (3/2)·(P_e_src + P_i_src) for energy
-(matching Hermes-3's pressure-equation convention).
+THE ACTUAL CONSERVATION TEST (printed as "CONSERVATION IDENTITY") is
+
+    ∮ (3/2) P v_E · dA  =  3/2∫SP dV  +  ∫E_VgradP dV  −  dW/dt
+
+with the **ExB channel alone** on the left and Hermes-3's **total** pressure
+source SP on the right. Three things make this different from F_in vs F_out:
+
+  * the ExB energy flux carries **3/2**, not the 5/2 enthalpy coefficient
+    (`evolve_pressure.cxx:270` advects P with a plain divergence);
+  * `SP<sp>` = prescribed source + every component's `energy_source`, so the
+    diamagnetic and anomalous channels are ALREADY in it — adding them to
+    the flux side double-counts;
+  * `E<sp>_VgradP = V·Grad_par(P)` is in neither source variable and is
+    13 % of the LCFS crossing on the SXD case.
+
+Verified on from_archer_6kW/422-425: the two sides agree to 1-3 % from x=30
+out to the separatrix, where the old F_in-vs-F_out reading was off by 50 %.
+
+F_out_q is still the TOTAL radial transport (ExB + magnetic drift + anomalous
++ optional flutter), which is the right number for "power crossing the
+separatrix" — just not for the closure test.
 
 Caching
 -------
@@ -80,7 +98,7 @@ def _compute():
     src_P_name = f"P{species}_src"
 
     # ── Load (work in BOUT-normalised units; convert to SI at the end) ──────
-    # We CANNOT use unnormalise=True here: xhermes only annotates conversion
+    # Use unnormalise=False here: xhermes only annotates conversion
     # factors for g_22, g11, J, dx, dy, dz — but NOT g_33, g_23, g_13. So under
     # unnormalise=True, g_22 is multiplied by rho_s0² (→ SI m²) while g_33/g_23
     # stay in normalised units, making radial_area_element_dtheta
@@ -114,40 +132,17 @@ def _compute():
     zdim = h3t.detect_toroidal_dim(ds)
     pdim = h3t.detect_poloidal_dim(ds)
 
-    # ── Drop y-boundary guard rows if the load kept them ──────────────────────
-    # xBOUT honours the GRID's `y_boundary_guards`, so a grid built with
-    # y_boundary_guards=2 returns a guard-retaining dataset even when this
-    # script asks for keep_yboundaries=False. That is not merely untidy:
-    # `.bout.ddy()` returns only the domain rows but RE-LABELS them onto the
-    # FIRST n_domain theta values rather than the domain rows' own labels.
-    # xarray then inner-joins on those labels inside `ExB_radial_velocity`, so
-    # each domain cell's ∂φ/∂θ is paired with the ∂φ/∂ζ and metric of a
-    # *different* cell — offset by the guards, and wrong everywhere past the
-    # first guard pair, not just at the ends.
-    # Visible symptom: Fig 1 dies in pcolormesh with
-    #   Dimensions of C (244, 112) should be one smaller than X(120)
-    # Invisible symptom: a mis-registered ExB flux, plus `Gamma_mag_*` left on
-    # the full 120 axis (load_grid_vars pads to the dataset) and `j1/j2`
-    # computed for the guarded layout — so the θ-band of every 1-D profile is
-    # taken from the wrong rows.
-    # Measured on from_archer_6kW/data/396 (grid ny=112, MYG=2 → 120 rows):
-    # ddy returns theta == full[:112] exactly, confirming the re-labelling.
-    # Guard layout is this codebase's usual one: region A at +MYG, B at +3·MYG.
+    # Remove retained y-guards before poloidal derivatives.
+    # xBOUT derivative coordinates require the interior poloidal layout.
     import netCDF4 as _nc_g
     with _nc_g.Dataset(gridfile) as _g0:
         _ny_g = int(_g0["ny"][:])
-    _MYG0 = int(ds.metadata.get("MYG", 2))
-    _nyi0 = int(ds.metadata.get("ny_inner", 0) or 0)
+    # The guard count per band is derived from the dump (npol - ny), NOT from
+    # MYG: a grid with y_boundary_guards=1 gives ny+4 rows while MYG reports
+    # 2, so a `npol == ny + 4*MYG` test matches neither layout and strips
+    # nothing. One implementation, in h3t.guard_rows.
     _npol = ds.sizes[pdim]
-    if _nyi0 > 0 and _npol == _ny_g + 4 * _MYG0:            # double null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_nyi0 + _MYG0, _nyi0 + 3 * _MYG0))
-                       + list(range(_ny_g + 3 * _MYG0, _ny_g + 4 * _MYG0)))
-    elif _npol == _ny_g + 2 * _MYG0:                        # single null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_ny_g + _MYG0, _ny_g + 2 * _MYG0)))
-    else:
-        _guard_rows = []
+    _guard_rows = h3t.guard_rows(ds, ny_grid=_ny_g)
     if _guard_rows:
         _keep_rows = [i for i in range(_npol) if i not in set(_guard_rows)]
         print(f"  dataset kept y-guards despite keep_yguards={keep_yguards} "
@@ -259,7 +254,7 @@ def _compute():
     chi_i  = _opt(f"P{ion_species}", "anomalous_chi") or _opt(ion_species,  "anomalous_chi")
     D_s    = _opt(n_name,           "anomalous_D")   or _opt(species,      "anomalous_D")
     T_s    = Te_eV if is_electron else Ti_eV
-    # BOUT.inp gives χ/D in SI [m²/s]. We're in normalised mode here, so
+    # BOUT.inp gives χ/D in SI [m²/s]. The dataset is normalised, so
     # rescale by 1/(rho_s0²·Omega_ci) to feed the anomalous-flux routines.
     _diff_norm = rho_s0**2 * Omega_ci
     chi_e_n = chi_e  / _diff_norm if _diff_norm > 0 else chi_e
@@ -294,7 +289,7 @@ def _compute():
     q_r     = q_ExB     + q_mag     + q_anom     + q_flutter
 
     # ── F_out(x): radial flux through each flux surface, full torus ─────────
-    # The θ-band over which we sum the surface area element. "full" is the
+    # The θ-band used to sum the surface area element. "full" is the
     # physical ∮ for a closed flux surface (correct for conservation). The
     # "outer_sol" option restricts to the LFS jyseps1_2 → jyseps2_2 band so
     # the numbers can be directly compared to v3_radial_flux.py.
@@ -310,13 +305,7 @@ def _compute():
     band_A = list(range(j11 + 1 + MYG,     j21 + 1 + MYG))
     band_B = list(range(j12 + 1 + 3 * MYG, j22 + 1 + 3 * MYG))
     closed_idx = [j for j in band_A + band_B if 0 <= j < nth]
-    # y-GUARD rows must be excluded from every band. They carry a nonzero
-    # grid source and a full volume element, so including them inflates the
-    # volume integral -- measured on from_archer_6kW/408 as +5.6 kW (0.9 %),
-    # on top of +32.6 kW (5.3 %) from the x-guards. `closed_idx` already
-    # excludes them (its bands start at j+1+MYG), but the complement over
-    # range(nth) does NOT, so `legs_idx` and the old `theta_band="full"`
-    # (= slice(None)) both swept them in.
+    # Exclude y-guards from source and surface-flux integration bands.
     _ny = int(m.get("ny", nth))
     _nyi = int(m.get("ny_inner", 0))
     _g = MYG if nth > _ny else 0
@@ -394,14 +383,7 @@ def _compute():
     print("Computing F_in(x) (cumulative source) ...")
     elem_vol = _no_t(ds["J"]) * _no_t(ds["dx"]) * _no_t(ds["dy"])   # m³/rad
 
-    # x-GUARD cells are ZEROED, not truncated: F_in(x) must keep the same x
-    # axis as F_out(x) for the two curves to be compared index by index. The
-    # cumsum previously ran over the FULL x range, so the two low-x guards fed
-    # straight into F_in(0) and the two high-x guards into the total -- +32.6
-    # kW of 619.7 (5.3 %) on from_archer_6kW/408, because the grid source is
-    # nonzero there (max 1.9e-5 vs 5.7e-5 interior) and an outward-expanding
-    # mesh gives those cells a large volume element. That alone made this
-    # script disagree with inspect_hermes_run.py, which masks `xs >= MXG`.
+    # Zero x-guard contributions while retaining the radial axis shared by F_in and F_out.
     _xg = np.ones(ds.sizes["x"], dtype=float)
     if MXG > 0:
         _xg[:MXG] = 0.0
@@ -425,7 +407,7 @@ def _compute():
 
     # Energy source: pressure source × (3/2) to convert ∂P/∂t to ∂E/∂t.
     # Hermes-3 evolves P; internal energy is (3/2)P, so dE/dt|_src = (3/2)·dP/dt|_src.
-    # For total energy balance we sum BOTH species' pressure sources.
+    # The total energy budget sums both species' pressure sources.
     # A species' P<sp>_src is APPLIED from the grid file by evolve_pressure
     # (`mesh->get(source, "P"+name+"_src")`, evolve_pressure.cxx:117) whether or
     # not `[<sp>] diagnose = true` writes it to the dump — and xBOUT does NOT
@@ -518,6 +500,39 @@ def _compute():
 
     dNdt_n = _cumulative_inventory(Ne)
     dNdt_q = _cumulative_inventory(1.5 * (Pe + Pi))
+
+    # ── The TOTAL pressure source, and the parallel pressure-gradient work ──
+    # `P<sp>_src` is only the PRESCRIBED source. Hermes-3 also writes
+    # `SP<sp> = P<sp>_src + (2/3)*sum(component energy_source)`
+    # (evolve_pressure.cxx:383-385) — the prescribed source PLUS every
+    # component's transfer term. And `E<sp>_VgradP = V*Grad_par(P)` is added
+    # straight to ddt(P) (:304) and is in NEITHER of them.
+    #
+    # On a closed flux surface the exact internal-energy identity is
+    #
+    #     ∮ (3/2) P v_E . dA  =  3/2∫SP dV + ∫E_VgradP dV − dW/dt
+    #
+    # with the ExB channel ALONE on the left: the diamagnetic and anomalous
+    # channels enter Hermes-3 as `energy_source`, so their volume integrals
+    # are already inside SP and adding them to the flux double-counts.
+    # Verified on from_archer_6kW/422-425: the two sides agree to 1-3 % from
+    # x=30 to the separatrix.
+    SPe = ds.get("SPe", None)
+    SPi = ds.get(f"SP{ion_species}", None)
+    F_in_q_SP = None
+    if SPe is not None and SPi is not None:
+        F_in_q_SP = _cumulative(1.5 * (SPe + SPi))
+    elif SPe is not None or SPi is not None:
+        print("  WARNING: only one species' SP<sp> is in the dump; the total "
+              "pressure source is incomplete, so the identity check is skipped.")
+    VgPe = ds.get("Ee_VgradP", None)
+    VgPi = ds.get(f"E{ion_species}_VgradP", None)
+    F_in_q_VgP = None
+    if VgPe is not None and VgPi is not None:
+        F_in_q_VgP = _cumulative(VgPe + VgPi)   # already W/m3: NO 3/2
+    if F_in_q_SP is None:
+        print("  SP<sp> not in the dump: the conservation identity cannot be "
+              "tested. Set [<sp>] diagnose = true and re-run one output step.")
     print(f"  storage term from {ds.sizes.get('t', 0)} frames"
           + ("" if ds.sizes.get("t", 0) >= 3 else "  (SECANT, not a rate)"))
 
@@ -553,6 +568,8 @@ def _compute():
     F_in_n_SI  = None if F_in_n  is None else F_in_n  * S_n_to_SI
     F_in_q_SI  = None if F_in_q  is None else F_in_q  * S_q_to_SI
     F_in_q_e_SI = None if F_in_q_e is None else F_in_q_e * S_q_to_SI
+    F_in_q_SP_SI = None if F_in_q_SP is None else F_in_q_SP * S_q_to_SI
+    F_in_q_VgP_SI = None if F_in_q_VgP is None else F_in_q_VgP * S_q_to_SI
     F_in_q_i_SI = None if F_in_q_i is None else F_in_q_i * S_q_to_SI
     dNdt_n_SI = None if dNdt_n is None else dNdt_n * S_n_to_SI
     dNdt_q_SI = None if dNdt_q is None else dNdt_q * S_q_to_SI
@@ -578,6 +595,8 @@ def _compute():
         F_in_n=F_in_n_SI,
         F_in_q=F_in_q_SI,
         F_in_q_e=F_in_q_e_SI,
+        F_in_q_SP=F_in_q_SP_SI,
+        F_in_q_VgP=F_in_q_VgP_SI,
         F_in_q_i=F_in_q_i_SI,
         dNdt_n=dNdt_n_SI,
         dNdt_q=dNdt_q_SI,
@@ -593,13 +612,8 @@ def _compute():
 # ── Cache load or compute ────────────────────────────────────────────────────
 _cache_pkl = h3t.cache_path("v3_radial_conservation_d2", dir_range, species,
                             "yd" if include_y_derivs else "noyd",
-                            "si8",    # si2: broken unnormalise=True cache;
-                                      # si3: P<sp>_src now recovered from the grid
-                                      # si4: F_in uses the same θ-band as F_out
-                                      # si5: storage term dN/dt(x) added
-                                      # si7: ExB mean/turbulent split of F_out_q
-                                      # si8: Te/Ti NaN frames (folder without Ti in the dump) filled from P/N
-                            theta_band)
+                            "si9",    # Cache format version.
+                            theta_band)   # rerun when θ-band toggled
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)
@@ -641,6 +655,38 @@ if _qm is not None and _qt is not None:
                   "isolate it.")
 
 
+# ── Conservation identity: ExB alone against the TOTAL pressure source ──────
+# This is the closure test. F_out_q (all channels) is the physical radial
+# transport and is NOT what closes against SP, because the diamagnetic and
+# anomalous channels are inside SP already.
+_SP = _C.get("F_in_q_SP")
+_VgP = _C.get("F_in_q_VgP")
+if _SP is not None and _qm is not None and _qt is not None:
+    _lhs = _qm + _qt                                  # ExB alone, 3/2
+    _rhs = _SP + (_VgP if _VgP is not None else 0.0)
+    if dNdt_q is not None:
+        _rhs = _rhs - dNdt_q
+    print("\n  CONSERVATION IDENTITY on the closed band  [kW]")
+    print("    \u222e(3/2)P v_E\u00b7dA  =  3/2\u222bSP dV + \u222bE_VgradP dV"
+          + ("  \u2212 dW/dt" if dNdt_q is not None else "")
+          + ("" if _VgP is not None else
+             "      (E*_VgradP absent: RHS incomplete)"))
+    print(f"    {'x':>5} {'ExB (LHS)':>11} {'3/2 int SP':>12} "
+          f"{'int VgradP':>11} {'RHS':>10} {'LHS/RHS':>9}")
+    for _x in [10, 20, 30, 40, 50, 60, int(ixsep1)]:
+        if not (0 <= _x < len(_lhs)):
+            continue
+        _r = _rhs[_x]
+        _v = (_VgP[_x] if _VgP is not None else 0.0) / 1e3
+        print(f"    {_x:5d} {_lhs[_x]/1e3:11.1f} {_SP[_x]/1e3:12.1f} "
+              f"{_v:11.1f} {_r/1e3:10.1f} "
+              f"{(_lhs[_x]/_r if _r else float('nan')):9.3f}")
+    print("    A ratio near 1 validates the flux model, the 3/2 ExB "
+          "coefficient and the\n    source bookkeeping together. F_out_q "
+          "above is the TOTAL transport\n    (ExB + diamagnetic + anomalous) "
+          "and is deliberately larger.")
+
+
 # ── Plots ────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 fig.suptitle(f"Radial conservation (SI) — species '{species}' "
@@ -676,7 +722,7 @@ if F_in_q is not None:
             label=r"$F_\mathrm{in}(x) = (3/2)\int_0^x (P_e\!+\!P_i)_\mathrm{src}\,dV$")
 if F_in_q_e is not None:
     ax.plot(x, F_in_q_e * 1e-6, "r:", lw=1, alpha=0.6, label="  e-only (input)")
-if F_in_q_i is not None: 
+if F_in_q_i is not None:
     ax.plot(x, F_in_q_i * 1e-6, "r--", lw=1, alpha=0.6, label="  i-only (input)")
 ax.plot(x, F_out_q * 1e-6, "b--", lw=2,
         label=r"$F_\mathrm{out}(x) = \oint q_r\,dA$  (flux through surface)")

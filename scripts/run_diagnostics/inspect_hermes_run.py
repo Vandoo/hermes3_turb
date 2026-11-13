@@ -4,7 +4,10 @@ inspect_hermes_run_new.py
 Inspect and plot diagnostics from a BOUT++ / Hermes-3 run.
 
 opt_plt options:
-  check_source   — plot particle/energy source profiles and totals
+  check_source   — plot particle/energy source profiles and totals, split per
+                   region (core / SOL / each divertor leg), plus the reaction and
+                   boundary channels (ionisation, recombination, CX, recycling,
+                   pump, wall/target reflection) with their divertor-leg share
   inspect_quick  — load normalised dataset for interactive inspection
   connLen        — (reserved)
   flux           — load dataset for flux analysis
@@ -220,13 +223,7 @@ if opt_plt == "check_source":
     xs = np.arange(nx)[:, None]
     ys = np.arange(ny)[None, :]
 
-    # Full (nx, ny) so the masks can be used to index the 2-D arrays directly.
-    # Drops the x-guards AND, on a guard-retaining squash, the y-guard rows.
-    # The y-guards were previously swept in: they carry a nonzero grid source
-    # and a full volume element, worth +5.6 kW of 619.7 (0.9 %) on
-    # from_archer_6kW/408. Small, but it is one of the two reasons this script
-    # and v3_radial_conservation.py disagreed on the input power (that one
-    # also kept the x-guards, +32.6 kW / 5.3 %).
+    # Interior masks exclude x- and y-guards, including inter-segment guard bands.
     _ny_grid = int(ds.metadata.get("ny", ny))
     _nyi = int(ds.metadata.get("ny_inner", 0))
     _MYG = int(ds.metadata.get("MYG", 2))
@@ -338,9 +335,198 @@ if opt_plt == "check_source":
             s = sum(integrate(f, m, k) for m in regions.values())
             worst = max(worst, abs(s - tot) / abs(tot) if tot else 0.0)
         log.info("regions tile the domain: worst parts-vs-total %.2e", worst)
+
+    # ------------------------------------------------------------------
+    # Reaction and boundary channels, per region
+    #
+    # The prescribed `*_src` table above answers "where do I PUT particles and
+    # power". This one answers "where does the plasma actually GET them" —
+    # ionisation, recombination, charge exchange, recycling, the pump and the
+    # wall/target reflections. The motivating question: a run whose divertor
+    # legs drain while `Sd+_iz` is the largest particle source in the domain
+    # is not short of ionisation, it is short of ionisation IN THE LEGS, and
+    # only a per-region split can tell those apart.
+    #
+    # THREE TRAPS, each of which silently changes the answer:
+    #
+    # 1. UNITS. `P<sp>_src` is a PRESSURE source [Pa/s], so it takes the 3/2
+    #    above. `R*` and `E*` are already POWER densities [W/m^3] under
+    #    `unnormalise=True`, so they take 1e-3 (W->kW) and NOT the 3/2.
+    #    Applying 1.5e-3 here would overstate every radiation and reaction
+    #    channel by 50 %.
+    # 2. TOROIDAL AVERAGE. A full-torus integral of a 3-D field is
+    #       sum_xyz f*J*dx*dy*dz * 2pi/(nz*dz)  ==  sum_xy <f>_z * J*dx*dy*2pi
+    #    so the z-MEAN is what pairs with `elem_vol * 2*pi`. The `[0, :, :, 0]`
+    #    indexing used for the static `*_src` variables samples a SINGLE
+    #    toroidal plane, which is fine for an axisymmetric prescribed source
+    #    and wrong for a turbulent reaction rate.
+    # 3. TIME. Unlike the prescribed sources these evolve, so the LAST frame
+    #    is used, not t=0. The frame is printed.
+    #
+    # Momentum channels (`F*`) and the internal e-i exchanges (`*_coll*`,
+    # `*_VgradP`) are deliberately excluded: the first is not an energy or
+    # particle channel, and the second is an internal transfer that cancels
+    # between species and only adds noise to a budget.
+    #
+    # Cross-check against `source_radiation_audit.py` part B, which is the
+    # reference implementation for these same channels (interior column).
+    # "_ex" (excitation radiation, R<sp>_ex) must be here: it is usually the
+    # LARGEST radiation channel, and leaving it out drops it silently with no
+    # error -- the table just looks complete and understates the exhaust.
+    RXN_SUFFIX = ("_iz", "_rec", "_ex", "_cx", "_pump", "_target_recycle",
+                  "_wall_recycle", "_target_refl", "_wall_refl")
+
+    def _rxn_field(var):
+        """z-mean at the last frame — see traps 2 and 3 above."""
+        da = ds[var]
+        if "t" in da.dims:
+            da = da.isel(t=-1)
+        zdim = next((d for d in ("zeta", "z") if d in da.dims), None)
+        return np.asarray((da.mean(zdim) if zdim else da).values)
+
+    rxn = []
+    for var in var_list:
+        if not var.endswith(RXN_SUFFIX) or var in Sp_list or var in Se_list:
+            continue
+        if var.startswith("S"):
+            rxn.append((var, _rxn_field(var), 1.0, "/s"))
+        elif var[0] in ("R", "E"):
+            rxn.append((var, _rxn_field(var), 1e-3, "kW"))
+
+    if not rxn:
+        log.info("\nno reaction/boundary channels in this dump "
+                 "(needs reactions + [d] diagnose = true)")
+    else:
+        SHORT = {"core": "core", "SOL (upstream)": "SOL_up",
+                 "inner lower leg": "in_low", "outer lower leg": "out_low",
+                 "inner upper leg": "in_up", "outer upper leg": "out_up"}
+        order = ["core"] + list(edge.keys())
+        legnames = [r for r in order if r.endswith("leg")]
+        nt_ds = ds.sizes.get("t", 1)
+        log.info("\nREACTION / BOUNDARY CHANNELS per region "
+                 "(frame %d of %d, z-averaged, full torus)", nt_ds - 1, nt_ds)
+        hdr = "%-20s" % "channel"
+        for r in order:
+            hdr += "%13s" % SHORT.get(r, r[:13])
+        hdr += "%13s%8s  %s" % ("TOTAL", "legs%", "unit")
+        log.info(hdr)
+        for name, field, fac, unit in rxn:
+            tot = integrate(field, inside, fac)
+            line = "%-20s" % name
+            for r in order:
+                line += "%13.3e" % integrate(field, regions[r], fac)
+            legsum = sum(integrate(field, regions[r], fac) for r in legnames)
+            line += "%13.3e%7.1f%%  %s" % (
+                tot, (100 * legsum / tot) if tot else float("nan"), unit)
+            log.info(line)
+        worst_r = 0.0
+        for _n, f, k, _u in rxn:
+            tot = integrate(f, inside, k)
+            if tot:
+                sm = sum(integrate(f, m, k) for m in regions.values())
+                worst_r = max(worst_r, abs(sm - tot) / abs(tot))
+        log.info("regions tile the domain: worst parts-vs-total %.2e", worst_r)
+        log.info("legs%s is the share landing in the divertor legs — the number "
+                 "that says whether recycling/ionisation reaches the targets.", "%")
         if worst > 1e-10:
             log.warning("  ^ regions do NOT tile the domain — the split above "
                         "is unreliable (check jyseps/ny_inner guard offsets)")
+
+    # ------------------------------------------------------------------
+    # Closed energy budget
+    #
+    # The table above says WHERE each channel acts. This says whether they
+    # ADD UP to the input power, which is a different question and the one
+    # that decides what the convergence target actually is. It cannot be
+    # done by summing the table: `Edd+_cx` and `Ed_wall_refl` are the same
+    # energy at two stages of its journey, so adding both double-counts the
+    # whole charge-exchange pathway. `balance.classify_energy_channel`
+    # carries that classification (and the Hermes-3 source lines behind it);
+    # this block only prints what it returns.
+    #
+    # Read `residual` as "implied sheath + unaccounted" unless the dump has
+    # E*_sheath in it — without [sheath_boundary_simple] diagnose = true the
+    # target load is not a diagnosed channel and necessarily lands here.
+    try:
+        from hermes3_turb.balance import energy_sink_budget
+    except ImportError as _e:
+        log.info("\nenergy budget skipped: hermes3_turb not importable here "
+                 "(%s). Run where the package is installed.", _e)
+    else:
+        # fast_recycle_fraction: 0 is Hermes-3's own default AND this
+        # campaign's setting (target_fast_recycle_fraction is commented out
+        # in BOUT.inp), which makes E*_recycle a pure prescribed-energy
+        # input. If a case switches it on, pass the value through or the
+        # fast part gets miscounted as an input instead of a transfer.
+        _frf = 0.0
+        if getattr(ds, "options", None) is not None:
+            try:
+                _frf = float(ds.options["d+"]["target_fast_recycle_fraction"])
+            except Exception:
+                _frf = 0.0
+        bud = energy_sink_budget(ds, interior=inside, fast_recycle_fraction=_frf)
+        # Not "%ss_kW" % cls: "loss" + "s" is "losss". The budget keys are
+        # irregular plurals, so they are spelled out.
+        _CLS_KEY = {"input": "inputs_kW", "loss": "losses_kW",
+                    "transfer": "transfers_kW"}
+
+        log.info("\nENERGY BUDGET (frame %d of %d, interior cells, full torus,"
+                 " target_fast_recycle_fraction = %g)",
+                 bud["frame"], ds.sizes.get("t", 1), _frf)
+        log.info("%-24s %-9s %12s", "channel", "class", "kW")
+        for _cls in ("input", "loss", "transfer"):
+            rows = [c for c in bud["channels"] if c[1] == _cls]
+            if not rows:
+                continue
+            for name, cl, val in rows:
+                log.info("%-24s %-9s %12.3f", name, cl, val)
+            log.info("%-24s %-9s %12.3f", "  subtotal", _cls,
+                     bud[_CLS_KEY[_cls]])
+            if _cls == "transfer":
+                log.info("%-24s %-9s %12s", "", "",
+                         "^ EXCLUDED from the budget by construction")
+        _net = bud["inputs_kW"] + bud["losses_kW"]
+        log.info("%-24s %-9s %12.3f", "NET (inputs + losses)", "", _net)
+        if bud["dWdt_kW"] is not None:
+            log.info("%-24s %-9s %12.3f", "dW/dt", "", bud["dWdt_kW"])
+        log.info("%-24s %-9s %12.3f   %s", "RESIDUAL", "",
+                 bud["residual_kW"],
+                 "unaccounted" if bud["sheath_diagnosed"]
+                 else "= implied sheath load + unaccounted")
+        if bud["W_J"] is not None:
+            log.info("stored energy W = %.1f J", bud["W_J"])
+        # Confinement time, the number the extrapolation actually needs: it
+        # is W over the power that genuinely LEAVES, not over the input.
+        #
+        # SIGN. `losses_kW` is negative, so -losses is outflow. A POSITIVE
+        # residual is input that the diagnosed channels cannot account for,
+        # which (with no E*_sheath in the dump) is the sheath/target load —
+        # i.e. also outflow, and it must be ADDED. Taking only
+        # `min(residual, 0)` omitted it and understated P_out by ~2x on the
+        # CD case, inflating tau_E from 7.5 to 21 ms.
+        _out = -bud["losses_kW"]
+        if bud["residual_kW"] > 0 and not bud["sheath_diagnosed"]:
+            _out += bud["residual_kW"]
+        if bud["W_J"] is not None and _out > 0:
+            log.info("tau_E = W / P_out = %.1f J / %.1f kW = %.3f ms"
+                     "  (P_out includes the implied sheath load)"
+                     if not bud["sheath_diagnosed"] else
+                     "tau_E = W / P_out = %.1f J / %.1f kW = %.3f ms",
+                     bud["W_J"], _out, bud["W_J"] / _out)
+            # Equilibrium stored energy if tau_E holds fixed, which is the
+            # same stiffness assumption flagged for chi_turb: W_eq = P_in *
+            # tau_E. Printed because it converts "how far from steady" into
+            # a number without needing a flux extrapolation.
+            _Weq = bud["inputs_kW"] * (bud["W_J"] / _out)
+            log.info("if tau_E holds: W_eq = P_in*tau_E = %.0f J (%.2fx "
+                     "current W); 95%% of the way takes %.1f ms",
+                     _Weq, _Weq / bud["W_J"],
+                     (bud["W_J"] / _out) * np.log(
+                         max(_Weq - bud["W_J"], 1e-9) / (0.05 * _Weq))
+                     if _Weq > bud["W_J"] else 0.0)
+        for _w in bud["warnings"]:
+            log.warning("  budget: %s", _w)
+
 
     if Se is not None and Sp is not None:
         # Two panels: the radial shape at the OMP (as before) and the

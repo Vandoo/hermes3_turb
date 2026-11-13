@@ -22,9 +22,19 @@ Three measures of the same near-target power are compared:
      v_pol = v_∥·(Bp/B) (so this is robust to the metric normalisation, unlike
      parallel_to_poloidal under unnormalise=True). This captures *only* the
      convective enthalpy channel — expect it to be a fraction (~2.5/γ) of (1).
-  3. Hermes-3 native poloidal power — `efe_tot_ylow` (+ ion equivalent if the
-     ion species was run with `diagnose = true`), the code's own Y-face energy
-     flow including conduction. This is the most complete and should match (1).
+  3. Hermes-3 native poloidal power — `efe_adv_ylow + efe_cond_ylow` (+ the ion
+     equivalents if the ion species was run with `diagnose = true`), the code's
+     own Y-face energy flow including conduction. This is the most complete and
+     should match (1).
+
+     NOT `ef*_tot_ylow`: `evolve_pressure` adds `flow_ylow_viscous_heating` to
+     the published total outside the guard that applies that heating to
+     `ddt(P)` (`evolve_pressure.cxx:317-328`), and `numerical_viscous_heating`
+     defaults to false, so on a `diagnose = true` run the published total
+     carries a channel that is in no equation — 9 % of the leg entrance on
+     `from_archer_6kW`. The channels are summed by
+     `h3t.parallel_energy_flow_ylow`, which falls back to `ef*_tot_ylow` only
+     when the split is unavailable, and says so.
 
 NOTE this is the most reliable as a *near-target* check only: upstream of the
 last few cells, turbulent radial transport removes power from the flux bundle,
@@ -165,24 +175,46 @@ if include_conduction and "Te" in dsa and "kappa_par_e" in dsa:
     kappa_e = h3t.to_field_aligned(dsa["kappa_par_e"], dsa)
 
 # Optional cross-check against Hermes-3's own Y-face energy flow (if present).
-# efe_tot_ylow is the **electron** Y-face flow — for a fair apples-to-apples
-# comparison with the e+i `adv` line we need the ion side too. Look for the
-# matching ion diagnostic (efi_tot_ylow / efd+_tot_ylow / …); add if found.
-efe = dsa.get("efe_tot_ylow", None)
-efi_name = next((k for k in (f"ef{ion_species}_tot_ylow",
-                             "efi_tot_ylow", "efd+_tot_ylow")
-                 if k in dsa.data_vars), None)
-efi = dsa.get(efi_name) if efi_name else None
+# Use advection + conduction, the part that is actually in ddt(P): the
+# published ef*_tot_ylow also carries the numerical viscous heating, which
+# numerical_viscous_heating=false (the default) keeps out of the equation.
+# h3t.parallel_energy_flow_ylow does that sum; fall back to the published
+# total only when the split is missing, and say so.
+def _native_flow(sp):
+    flow = h3t.parallel_energy_flow_ylow(dsa, sp, include_conduction=True,
+                                         include_viscous_heating=False)
+    if flow is not None:
+        return flow, f"ef{sp}_adv+cond_ylow"
+    tot = dsa.get(f"ef{sp}_tot_ylow")
+    if tot is not None:
+        print(f"WARNING: no 'ef{sp}_adv_ylow' in the dump — falling back to "
+              f"'ef{sp}_tot_ylow', which may include numerical viscous "
+              "heating that is in no equation.")
+        return tot, f"ef{sp}_tot_ylow"
+    return None, None
+
+
+efe, _efe_lbl = _native_flow("e")
+efi, _efi_lbl = (None, None)
+for _sp in [s for s in (ion_species, "i", "d+") if s]:
+    if any(f"ef{_sp}_{k}_ylow" in dsa.data_vars for k in ("adv", "tot")):
+        efi, _efi_lbl = _native_flow(_sp)
+        if efi is not None:
+            break
 have_native = efe is not None
-native_label = "efe_tot_ylow (e)"
+native_label = f"{_efe_lbl} (e)"
 if efi is not None:
-    native_label = f"ef_tot_ylow (e+{ion_species})"
-    print(f"native cross-check includes ion diagnostic '{efi_name}'")
+    native_label = f"ef_adv+cond_ylow (e+{ion_species})"
+    print(f"native cross-check includes the ion diagnostic '{_efi_lbl}'")
 elif efe is not None:
-    print("native cross-check uses 'efe_tot_ylow' only — no matching ion "
-          "ef*_tot_ylow found; the green line is electron-only and will sit "
+    print(f"native cross-check uses '{_efe_lbl}' only — no matching ion "
+          "Y-face flow found; the green line is electron-only and will sit "
           "below the e+i 'adv' line by ~½ in a Te≈Ti plasma. "
           "Set diagnose=true on the ion species to get the full comparison.")
+    for _sp in ("e",):
+        if f"ef{_sp}_visc_heat_ylow" in dsa.data_vars:
+            print(f"  (ef{_sp}_visc_heat_ylow is present and deliberately "
+                  "excluded — see the module docstring.)")
 _bp = {}
 def bp(y):
     if y not in _bp:
@@ -251,7 +283,7 @@ def _ion_kin_density(y):
     velocity at the sheath FACE (between i_dom and i_gc), not at the cell
     centre i_dom, so a cap on the cell-centre value would only mask the
     time-averaging artefact, not enforce physics. The M_∥ sanity print
-    flags those artefacts so the user can interpret the kin column.
+    flags nonfinite and sign-inconsistent kinetic-flux estimates.
     """
     Vi_y = Vi.isel({pdim: y})
     return 0.5 * AA_ion * _mp * Ni.isel({pdim: y}) * Vi_y ** 3
@@ -270,9 +302,11 @@ def _sum_face(da, y):
     return float(np.where(np.isfinite(v), v, 0.0).sum())
 
 def P_native(y):
-    """Σ_{x,ζ}|ef*_tot_ylow| at face y (e + i if both available; cross-check
-    against the sheath. Matches the e+i `adv` line when both species are
-    diagnosed)."""
+    """Σ_{x,ζ}|ef*_adv_ylow + ef*_cond_ylow| at face y (e + i if both are
+    available; cross-check against the sheath. Matches the e+i `adv` line when
+    both species are diagnosed). The numerical viscous heating that
+    ef*_tot_ylow also publishes is excluded — it is in no equation unless the
+    run set numerical_viscous_heating=true."""
     if not have_native:
         return np.nan
     tot = _sum_face(efe, y)
@@ -447,7 +481,7 @@ fig.tight_layout()
 from hermes3_turb.target import target_physical_distance, fit_eich, fit_double_exp
 
 # Eich / 2-exp fit window in the same coord as the radial profile (s from
-# separatrix at the plate, [mm]). Tweak if the SOL extent of your case differs.
+# separatrix at the plate, [mm]). Adjust to the radial domain.
 fit_s_range_mm = (-3, 30)
 fit_s0         = False      # see hermes3_turb.target.fit_eich; True for shifted-peak cases
 

@@ -1,62 +1,23 @@
-"""
-rescale_restart.py
-------------------
-Multiply the density of a Hermes-3 restart by a constant factor, so a run can be
-started AT the density you want instead of being fuelled up to it.
+"""Rescale species densities and momenta in Hermes-3 restart files.
 
-Why: the particle fill time of an edge/SOL case is milliseconds (see
-particle_fill_time.py), while a 3D turbulence run advances microseconds per day
-of wall clock.  Waiting for a gas puff to raise n_e,sep is not possible.  What is
-possible is to set n directly and let the turbulence re-find its saturated state,
-which happens on the much shorter energy/turbulence time.
+N<species> and NV<species> are multiplied by the same factor, preserving
+parallel velocity. keep-P retains pressure and reduces temperature by that
+factor; keep-T scales pressure too and preserves temperature. Neutrals are
+included unless --no-scale-neutrals is specified.
 
-What gets scaled, and why
-  N<species>   x f    density
-  NV<species>  x f    momentum - keeps the parallel velocity V = NV/N unchanged.
-  P<species>   x f    ONLY in --scaling keep-T (see below)
-
-Two ways to handle the pressure, and the choice matters:
-
-  keep-P (default)  scale N and NV, leave P alone.  The stored energy W is
-                    unchanged, so no energy transient is created.  T = P/N falls
-                    to T/f, which is roughly where fixed-power balance wants it
-                    anyway (T ~ (P_in/n)^alpha).
-
-  keep-T            scale P with N so T is unchanged.  Gentler on the divertor
-                    (no sudden cooling, less risk of a cold/stiff crash), but it
-                    raises W by f, and that excess has to decay over tau_E.
-                    Check tau_E with particle_fill_time.py first: if tau_E is
-                    long compared with what you can afford to run, keep-T just
-                    swaps a particle transient you cannot outrun for an energy
-                    transient you cannot outrun either.
-
-What does NOT get scaled
-  Vort, phi           Hermes-3 inverts the vorticity in the BOUSSINESQ
-                      approximation: src/vorticity.cxx sets the Laplacian
-                      coefficient to average_atomic_mass / B^2, a fixed reference
-                      mass with NO density in it.  A uniform density rescale
-                      therefore does not invalidate the vorticity inversion.
-                      phi is only a solver initial guess and is re-solved anyway.
-  T<species>, V<species>, geometry, metric, metadata
-
-Neutrals (--scale-neutrals, on by default) are scaled too: in steady state the
-neutral density tracks the recycling flux, which tracks the plasma density, so
-leaving them un-scaled just means waiting out the (also slow) neutral fill.
-
-This is initial-condition surgery, not a converged solution.  The rescaled state
-is NOT a self-consistent equilibrium: expect a transient while the profiles,
-flows and turbulence re-adjust, and check the run has re-saturated (e.g. with
-turbulence_monitor.py) before trusting any output.
+Vort, phi, diagnosed temperatures/velocities, geometry, and metadata are
+unchanged. The Boussinesq vorticity inversion uses a reference mass density.
+The modified state requires relaxation before it represents an equilibrium.
 
 Usage
 -----
-    python rescale_restart.py <restart_dir> --factor 1.478
-    python rescale_restart.py <restart_dir> --target-ne 5.0e18 --current-ne 3.383e18
+    python rescale_plasma_restart.py RESTART_DIR --factor 1.478
+    python rescale_plasma_restart.py RESTART_DIR --target-ne 5e18 --current-ne 3.4e18
 
-    -o, --out DIR        write scaled copies here (default: <restart_dir>_scaled)
-        --in-place       modify the files where they are (no copy) - be sure
+    -o, --out DIR       destination (default: RESTART_DIR_scaled)
+        --in-place      modify source files
         --no-scale-neutrals
-        --dry-run        report what would change, write nothing
+        --dry-run       report changes without writing
 """
 
 from __future__ import annotations
@@ -159,7 +120,7 @@ def main(argv=None):
     print("  (Vort/phi deliberately untouched - Boussinesq inversion has no n in it)")
     if keep_T:
         print(f"  mode keep-T : T unchanged, stored energy W -> W x {factor:.4f}"
-              f" (decays over tau_E - check you can afford that)")
+              f" (decays over tau_E - allow for the energy-relaxation time)")
     else:
         print(f"  mode keep-P : W unchanged, T -> T / {factor:.4f}"
               f" (no energy transient; watch for cold-divertor stiffness)")
@@ -220,7 +181,7 @@ def main(argv=None):
     print("  - drop start_timestep (e.g. 1e-3) for the first job: the state is not")
     print("    a self-consistent solution and the solver will complain otherwise")
     print("  - size the puff and pump_recycle_multiplier for the NEW density, or the")
-    print("    run will just resume drifting toward the old equilibrium")
+    print("    the initial state will relax toward the equilibrium set by the inputs")
     print("  - re-check saturation before using any output")
     return 0
 

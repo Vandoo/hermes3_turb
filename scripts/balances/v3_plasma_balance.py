@@ -7,8 +7,14 @@ matches the volume-integrated particle/energy sources, following the approach
 in the STORM scripts (v2_fconserv_plo.py).
 
 Conservation check (steady state):
-  Particle: F_x(outer) - F_x(inner) ≈ ∫ S_n dV  (+ target losses)
-  Energy:   Q_x(outer) - Q_x(inner) ≈ ∫ S_E dV  (+ target losses)
+  Particle: F_x(outer) - F_x(inner) ≈ ∫ S_n dV        (+ target losses)
+  Energy:   Q_x(outer) - Q_x(inner) ≈ ∫ (3/2)S_P dV   (+ target losses)
+
+The 3/2 on the energy source is not optional: Hermes-3 evolves the PRESSURE,
+so `P<sp>_src` is dP/dt while the internal energy density is 3/2 P. The radial
+flux is already the 5/2 enthalpy flux and the storage term is 3/2 d∫P dV/dt,
+so a budget built on the raw pressure source closes 1.5x high.
+`h3t.energy_source` carries the factor.
 
 Also plots the local poloidal conservation check:
   d(F_pol)/dθ  vs  F_x   (should agree if particle balance holds locally)
@@ -32,7 +38,7 @@ import matplotlib.pyplot as plt
 
 import hermes3_turb as h3t
 from xhermes import open_hermesdataset
-from hermes3_turb.load import get_parallel_velocity
+from hermes3_turb.load import get_parallel_velocity, _no_t
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 data_root    = "./"
@@ -81,40 +87,17 @@ def _compute():
     zdim = h3t.detect_toroidal_dim(ds)
     pdim = h3t.detect_poloidal_dim(ds)
 
-    # ── Drop y-boundary guard rows if the load kept them ──────────────────────
-    # xBOUT honours the GRID's `y_boundary_guards`, so a grid built with
-    # y_boundary_guards=2 returns a guard-retaining dataset even when this
-    # script asks for keep_yboundaries=False. That is not merely untidy:
-    # `.bout.ddy()` returns only the domain rows but RE-LABELS them onto the
-    # FIRST n_domain theta values rather than the domain rows' own labels.
-    # xarray then inner-joins on those labels inside `ExB_radial_velocity`, so
-    # each domain cell's ∂φ/∂θ is paired with the ∂φ/∂ζ and metric of a
-    # *different* cell — offset by the guards, and wrong everywhere past the
-    # first guard pair, not just at the ends.
-    # Visible symptom: Fig 1 dies in pcolormesh with
-    #   Dimensions of C (244, 112) should be one smaller than X(120)
-    # Invisible symptom: a mis-registered ExB flux, plus `Gamma_mag_*` left on
-    # the full 120 axis (load_grid_vars pads to the dataset) and `j1/j2`
-    # computed for the guarded layout — so the θ-band of every 1-D profile is
-    # taken from the wrong rows.
-    # Measured on from_archer_6kW/data/396 (grid ny=112, MYG=2 → 120 rows):
-    # ddy returns theta == full[:112] exactly, confirming the re-labelling.
-    # Guard layout is this codebase's usual one: region A at +MYG, B at +3·MYG.
+    # Remove retained y-guards before poloidal derivatives.
+    # xBOUT derivative coordinates require the interior poloidal layout.
     import netCDF4 as _nc_g
     with _nc_g.Dataset(gridfile) as _g0:
         _ny_g = int(_g0["ny"][:])
-    _MYG0 = int(ds.metadata.get("MYG", 2))
-    _nyi0 = int(ds.metadata.get("ny_inner", 0) or 0)
+    # The guard count per band is derived from the dump (npol - ny), NOT from
+    # MYG: a grid with y_boundary_guards=1 gives ny+4 rows while MYG reports
+    # 2, so a `npol == ny + 4*MYG` test matches neither layout and strips
+    # nothing. One implementation, in h3t.guard_rows.
     _npol = ds.sizes[pdim]
-    if _nyi0 > 0 and _npol == _ny_g + 4 * _MYG0:            # double null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_nyi0 + _MYG0, _nyi0 + 3 * _MYG0))
-                       + list(range(_ny_g + 3 * _MYG0, _ny_g + 4 * _MYG0)))
-    elif _npol == _ny_g + 2 * _MYG0:                        # single null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_ny_g + _MYG0, _ny_g + 2 * _MYG0)))
-    else:
-        _guard_rows = []
+    _guard_rows = h3t.guard_rows(ds, ny_grid=_ny_g)
     if _guard_rows:
         _keep_rows = [i for i in range(_npol) if i not in set(_guard_rows)]
         print(f"  dataset kept y-guards despite keep_yguards={keep_yguards} "
@@ -234,10 +217,75 @@ def _compute():
     for k, v in pbal.items():
         print(f"  {k:30s} = {v:.3e}")
 
+    # ── Per-leg particle budget ──────────────────────────────────────────────
+    # The global balance above cannot say WHY a divertor leg drains: a leg can
+    # empty because too little is delivered to it or because too much leaves,
+    # and the in-leg ionisation alone does not separate those. This closes
+    #   dN/dt = [Phi_x(inner) - Phi_x(outer)] + [Phi_th(start) - Phi_th(end)]
+    #           + integral(S_iz + S_rec) dV
+    # per leg, with the SAME Gamma_r_global and F_pol used above.
+    #
+    # ONLY the charged-species reaction channels belong here. `Sd_pump` is a
+    # NEUTRAL sink -- it removes d atoms, not d+ ions -- so putting it in a
+    # plasma budget double-counts a term that acts on the ion density only
+    # indirectly, by starving the ionisation source. The neutral budget is a
+    # separate calculation and needs the NEUTRAL fluxes, which this script
+    # does not compute.
+    rxn_src = {}
+    for _v in ds.data_vars:
+        if _v.startswith("S") and "+" in _v and _v.endswith(("_iz", "_rec")):
+            rxn_src[_v] = ds[_v]
+    print("\n===== Per-leg particle budget =====")
+    if not rxn_src:
+        print("  no charged-species S*_iz / S*_rec in the dump "
+              "(needs `reactions` + diagnose) \u2014 skipping")
+    else:
+        legb = h3t.leg_particle_budget(
+            ds, radial_flux=Gamma_r_global, poloidal_flux=F_pol,
+            sources=rxn_src, n=n,
+        )
+        # This script loads unnormalise=False, so the budget comes back
+        # NORMALISED and must be converted or the numbers read as particle
+        # rates while being 3.6e17 too small.
+        #
+        # ONE factor converts every RATE in the budget, because
+        #   Nnorm*Omega_ci*rho_s0**3  ==  Nnorm*Cs0*rho_s0**2  ==  f_part
+        # (Omega_ci*rho_s0 = Cs0). That holds for all three kinds of term:
+        # a volume source (density-rate x normalised volume), a surface flux
+        # (flux density x normalised area), and dN/dt (normalised N over
+        # normalised time, since `ds["t"]` is also normalised here). The
+        # inventory N itself is not a rate and takes Nnorm*rho_s0**3.
+        # Verified: inner-lower-leg Sd+_iz 1.130e3 x 3.6118e17 = 4.081e20 /s,
+        # matching the time-mean value cross-checked against
+        # inspect_hermes_run.py check_source.
+        _f_rate = (float(m.get("Nnorm", 1.0)) * float(m.get("Cs0", 1.0))
+                   * float(m.get("rho_s0", 1.0))**2)
+        _f_N = float(m.get("Nnorm", 1.0)) * float(m.get("rho_s0", 1.0))**3
+        cols = (["net_Fx", "F_xpoint", "F_target"] + sorted(rxn_src)
+                + ["dNdt", "residual", "N"])
+        print(f"  (SI; normalised values x {_f_rate:.4e} for rates, "
+              f"x {_f_N:.4e} for N)")
+        print("  " + "%-18s" % "leg" + "".join("%13s" % c[:13] for c in cols))
+        for _leg, _d in legb.items():
+            print("  " + "%-18s" % _leg
+                  + "".join("%13.3e" % (_d.get(c, float("nan"))
+                                        * (_f_N if c == "N" else _f_rate))
+                            for c in cols))
+        print("  net_Fx > 0 = radial delivery INTO the leg; F_target is the "
+              "sheath outflow at the plate.")
+        print("  Read the residual against the largest term in the row: a leg "
+              "whose sources and")
+        print("  outflows balance but which still drains is being starved of "
+              "RADIAL delivery.")
+
     print("\n===== Energy balance =====")
+    # `energy_source` carries the 3/2 (Hermes-3 evolves P; the internal
+    # energy is 3/2 P), so `volume_source` below is comparable with the 5/2
+    # enthalpy fluxes. On sxd_MU/new_ny36/fresh_ES/140 the ratio
+    # Qx_inner_LFS/volume_source is 1.048.
     ebal = h3t.energy_balance(
         ds, P, v_par, phi,
-        source_density=ds[src_P_name] if src_P_name in ds else None,
+        source_density=h3t.energy_source(ds, species),
         x_inner=x_inner, x_outer=x_outer,
         theta_inner_sol=inner_sol,
         theta_outer_sol=outer_sol,
@@ -333,11 +381,20 @@ def _compute():
         # tail purely because P → 0 in the far SOL and legs, where both energies
         # are negligible, so a pointwise median/percentile overstates the
         # channel's weight; it is printed only for context.
-        _vol = ds["J"] * ds["dx"] * ds["dy"] * ds["dz"]
+        # Interior cells only: in the x-guards `phi.bout.ddx()` is a
+        # one-sided difference against a boundary value, so v_b there is not a
+        # physical drift. `_no_t` on the metric avoids the J/dx/dy-carries-t
+        # broadcasting trap (a `t` axis on the element but not on the field
+        # rescales the sum by Nt).
+        _vol = (_no_t(ds["J"]) * _no_t(ds["dx"])
+                * _no_t(ds["dy"]) * _no_t(ds["dz"]))
+        _int = xr.DataArray(h3t.interior_mask(ds), dims=("x", pdim))
+        _vol = _vol.where(_int, other=0.0)
         _dims = [d for d in (E_perp.dims) if d != "t"]
         _Wp = float((E_perp * _vol).sum(dim=_dims).mean())
         _Wt = float((E_th * _vol).sum(dim=_dims).mean())
-        _rat = np.asarray((E_perp / E_th.where(E_th > 0)).values, dtype=float)
+        _rat = np.asarray(
+            (E_perp / E_th.where(E_th > 0)).where(_int).values, dtype=float)
         _rat = _rat[np.isfinite(_rat)]
         kperp = dict(reservoir=_Wp / _Wt if _Wt else float("nan"),
                      median=float(np.median(_rat)) if _rat.size else float("nan"),
@@ -372,15 +429,27 @@ def _compute():
         Fx_out = Fx[x_out_loc, :]
         return dGpol, Fx_out - Fx_in
 
-    def source_profile(src_name):
-        if src_name not in ds:
+    def source_profile(src):
+        """θ-profile of the volume source, x-guards already excluded by
+        `_radial_sum` (it runs MXG .. nx-1-MXG). `src` is a DataArray, not a
+        name, so the caller decides the 3/2 — see `h3t.energy_source`."""
+        if src is None:
             return None
-        return _radial_sum(_column(ds[src_name] * ds["J"] * ds["dx"] * ds["dy"]))
+        return _radial_sum(_column(src * ds["J"] * ds["dx"] * ds["dy"]))
 
     dGpol_n, dFx_n = divergence_terms(F_pol, Gamma_r)
     dGpol_q, dFx_q = divergence_terms(Q_pol, q_r)
-    S_n = source_profile(src_n_name)
-    S_q = source_profile(src_P_name)
+    _src_n = h3t.particle_source(ds, species)
+    _src_q = h3t.energy_source(ds, species)      # = 3/2 * P<sp>_src
+    if _src_n is None or _src_q is None:
+        _missing = [nm for nm, v in ((src_n_name, _src_n), (src_P_name, _src_q))
+                    if v is None]
+        print(f"  !! WARNING: {', '.join(_missing)} not in the dump for species "
+              f"'{species}' — that source is omitted from the balance, so the "
+              f"residual is meaningless rather than large. Present: "
+              f"{sorted(v for v in ds.data_vars if v.endswith('_src'))}")
+    S_n = source_profile(_src_n)
+    S_q = source_profile(_src_q)
 
     return dict(
         theta_coord=ds[pdim].values,
@@ -402,16 +471,13 @@ def _compute():
 # ── Cache load or compute ────────────────────────────────────────────────────
 _cache_pkl = h3t.cache_path("v3_plasma_balance", dir_range, species,
                             "yd" if include_y_derivs else "noyd",
-                            "b8")
-                                    # b2: core/SOL/PFR radial split + ⊥KE ratio
-                                    # b3: ⊥KE as a volume-integrated reservoir
-                                    # b4: diamagnetic work term φP∇×(b/B)
-                                    # b5: + its B.9→B.10 identity check
-                                    # b8: Te/Ti NaN frames (folder without Ti in the dump) filled from P/N
+                            "b10")  # Cache format version.
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)
     print("\n===== Particle balance (from cache) =====")
+    print("  (the per-leg particle budget is not cached \u2014 "
+          "set use_cache = False to print it)")
     for k, v in _C["pbal"].items():
         print(f"  {k:30s} = {v:.3e}")
     print("\n===== Energy balance (from cache) =====")

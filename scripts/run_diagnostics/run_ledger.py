@@ -23,8 +23,7 @@ Columns (all read from <folder>/BOUT.log.0 and <folder>/BOUT.inp):
   le_fails, nl_fails  CVODE local-error / nonlinear-convergence fails
   exception         first BoutException line in the log, if any
 
-Compare runs in us_per_day, not by fail counts: a run with many NL fails can
-still be the faster one (see memory bug_wall_limit_exceeds_slurm_time).
+us_per_day reports throughput independently of nonlinear-failure counts.
 
 Cluster data: do NOT run this through an sshfs mount on .nc-heavy folders -
 copy it (and parse_slurm_speed.py, which it imports) to the cluster and run it

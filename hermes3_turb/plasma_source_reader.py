@@ -274,12 +274,7 @@ class PlasmaSourceReader:
                         self.S[ix, iy] += S_n0 * np.exp(-((x - x_Sn) / w_Sn)**2)
                         self.S_E[ix, iy] += S_E0 * np.exp(-((x - x_SE) / w_SE)**2)
 
-                # The core source must land ONLY on closed flux surfaces.
-                # Until 2026-11-02 the second clause read `> jyseps1_2 - 1`,
-                # which put the CORE profile on row jyseps1_2 -- the last row
-                # of the outer-upper leg, an OPEN field line. It went unnoticed
-                # because Sp_core below slices from jyseps1_2+1, so the stray
-                # row was reported as "Sp_tar" instead. Check the row SET.
+                # Verify that core sources cover exactly the closed-field-line rows.
                 _expect = set(range(self.jyseps1_1 + 1, self.jyseps2_1 + 1)) \
                         | set(range(self.jyseps1_2 + 1, self.jyseps2_2 + 1))
                 if _core_rows_seen != _expect:

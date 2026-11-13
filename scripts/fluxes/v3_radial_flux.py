@@ -74,40 +74,17 @@ def _compute():
     zdim = h3t.detect_toroidal_dim(ds)
     pdim = h3t.detect_poloidal_dim(ds)
 
-    # ── Drop y-boundary guard rows if the load kept them ──────────────────────
-    # xBOUT honours the GRID's `y_boundary_guards`, so a grid built with
-    # y_boundary_guards=2 returns a guard-retaining dataset even when this
-    # script asks for keep_yboundaries=False. That is not merely untidy:
-    # `.bout.ddy()` returns only the domain rows but RE-LABELS them onto the
-    # FIRST n_domain theta values rather than the domain rows' own labels.
-    # xarray then inner-joins on those labels inside `ExB_radial_velocity`, so
-    # each domain cell's ∂φ/∂θ is paired with the ∂φ/∂ζ and metric of a
-    # *different* cell — offset by the guards, and wrong everywhere past the
-    # first guard pair, not just at the ends.
-    # Visible symptom: Fig 1 dies in pcolormesh with
-    #   Dimensions of C (244, 112) should be one smaller than X(120)
-    # Invisible symptom: a mis-registered ExB flux, plus `Gamma_mag_*` left on
-    # the full 120 axis (load_grid_vars pads to the dataset) and `j1/j2`
-    # computed for the guarded layout — so the θ-band of every 1-D profile is
-    # taken from the wrong rows.
-    # Measured on from_archer_6kW/data/396 (grid ny=112, MYG=2 → 120 rows):
-    # ddy returns theta == full[:112] exactly, confirming the re-labelling.
-    # Guard layout is this codebase's usual one: region A at +MYG, B at +3·MYG.
+    # Remove retained y-guards before poloidal derivatives.
+    # xBOUT derivative coordinates require the interior poloidal layout.
     import netCDF4 as _nc_g
     with _nc_g.Dataset(gridfile) as _g0:
         _ny_g = int(_g0["ny"][:])
-    _MYG0 = int(ds.metadata.get("MYG", 2))
-    _nyi0 = int(ds.metadata.get("ny_inner", 0) or 0)
+    # The guard count per band is derived from the dump (npol - ny), NOT from
+    # MYG: a grid with y_boundary_guards=1 gives ny+4 rows while MYG reports
+    # 2, so a `npol == ny + 4*MYG` test matches neither layout and strips
+    # nothing. One implementation, in h3t.guard_rows.
     _npol = ds.sizes[pdim]
-    if _nyi0 > 0 and _npol == _ny_g + 4 * _MYG0:            # double null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_nyi0 + _MYG0, _nyi0 + 3 * _MYG0))
-                       + list(range(_ny_g + 3 * _MYG0, _ny_g + 4 * _MYG0)))
-    elif _npol == _ny_g + 2 * _MYG0:                        # single null
-        _guard_rows = (list(range(_MYG0))
-                       + list(range(_ny_g + _MYG0, _ny_g + 2 * _MYG0)))
-    else:
-        _guard_rows = []
+    _guard_rows = h3t.guard_rows(ds, ny_grid=_ny_g)
     if _guard_rows:
         _keep_rows = [i for i in range(_npol) if i not in set(_guard_rows)]
         print(f"  dataset kept y-guards despite keep_yguards={keep_yguards} "
@@ -121,7 +98,7 @@ def _compute():
         return da.mean("t") if "t" in da.dims else da
 
     # ── SI conversion factors (data loaded normalised; convert at the end) ──
-    # We load unnormalise=False because xhermes only annotates g_22 / g11 (not
+    # Use unnormalise=False because xhermes only annotates g_22 / g11 (not
     # g_33 / g_23), so a mixed-unit metric breaks `radial_flux_profile`. Then
     # the final results are converted to SI by a single scalar factor.
     m_meta = ds.metadata
@@ -373,6 +350,8 @@ def _compute():
         Ne_omp_t=Ne_omp_t * Nnorm,
         Te_omp_t=Te_omp_t * Tnorm_eV,
         Ti_omp_t=Ti_omp_t * Tnorm_eV,
+        # Loader uses unnormalise=False; cache physical seconds explicitly.
+        t_s=np.asarray(ds["t"].values, dtype=float) / float(ds.metadata["Omega_ci"]),
         s_omp_mm=np.asarray(s_omp_mm),
         # 1-D coords
         theta=theta,
@@ -388,16 +367,7 @@ def _compute():
 # ── Cache load or compute ────────────────────────────────────────────────────
 _cache_pkl = h3t.cache_path("v3_radial_flux", dir_range,
                             "yd" if include_y_derivs else "noyd",
-                            "si8")
-                                      # bump suffix to invalidate normalised caches
-                                      # si3: adds the per-snapshot OMP profiles
-                                      #      (*_omp_t) the ±1σ band needs
-                                      # si4: y-guard rows are now dropped before
-                                      #      the fluxes are computed — an si3
-                                      #      cache for a guard-retaining dump
-                                      #      holds MIS-REGISTERED ExB fluxes
-                                      # si7: Te/Ti NaN frames (folder without Ti in the dump) filled from P/N
-                                      # si8: s_omp_mm at the TRUE midplane, mapped by ψ (ny32 row was Z=0.475 m)
+                            "si9")    # Cache format version.
 if use_cache and _cache_pkl.exists():
     print(f"Cache hit: {_cache_pkl}")
     _C = h3t.load_cache(_cache_pkl)

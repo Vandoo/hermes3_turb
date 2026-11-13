@@ -49,7 +49,7 @@ import netCDF4 as nc
 # --------------------------------------------------------------------------- #
 # CONFIG
 # --------------------------------------------------------------------------- #
-TARGET_NE_SEP = 5.0e18     # [m^-3] separatrix density you are aiming at (None to skip)
+TARGET_NE_SEP = 5.0e18     # [m^-3] target separatrix density (None to skip)
 US_PER_DAY    = 1.0        # observed wall-clock rate, microseconds of plasma time per day
 DUMP_NAMES    = ("boutdata_guards.nc", "boutdata.nc")   # preference order
 
@@ -285,7 +285,7 @@ def main(argv):
         print(f"  tau_fill(neutral)  N_d/(dN_d/dt) = {Nd[-1]/dNd*1e3:8.3f} ms")
 
     # particle replacement: ions lost at the sheath.  The target recycling
-    # diagnostic is multiplier * Gamma_target, so back out Gamma_target if we
+    # diagnostic is multiplier * Gamma_target, so recover Gamma_target when the diagnostic
     # can find the multiplier; otherwise report the recycled flux itself.
     gamma_t = trecyc            # lower bound on the sheath ion flux
     if gamma_t > 0:

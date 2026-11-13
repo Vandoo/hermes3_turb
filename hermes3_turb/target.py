@@ -176,7 +176,7 @@ def _field_line_incidence(ds, pdim, y_idx):
     metric — but xhermes versions differ in WHICH covariant components they
     unnormalise (some do only ``g_22``, others also ``g_33``/``g_23``). A
     partial/inconsistent unnormalisation corrupts the ratio (e.g. Bp/B → 1).
-    To be robust we revert each component to the dump's raw normalisation by
+    Convert each component to the dump's raw normalisation by
     dividing out whatever ``conversion`` factor xhermes recorded when it set
     ``units_type='SI'`` — leaving all three on one consistent footing.
     """
@@ -401,6 +401,7 @@ def target_heat_flux_density(
     sheath_ion_polytropic=1.0,
     ion_species="i",
     align_fields=True,
+    components=False,
 ):
     """
     Compute heat flux density at a named divertor target [W/m²].
@@ -455,6 +456,10 @@ def target_heat_flux_density(
     align_fields : bool, default True
         Align shifted rows before averaging. Set False for fields that the
         caller has already aligned. Only the required rows are loaded.
+    components : bool, default False
+        Also return the per-species channel decomposition (see Returns). The
+        two channels sum to ``q_local`` exactly; nothing is recomputed, the
+        parts are simply not discarded.
 
     Returns
     -------
@@ -462,6 +467,29 @@ def target_heat_flux_density(
         In field-aligned toroidal coordinates when align_fields=True.
     q_avg   : xarray.DataArray (x,)       toroidal-mean heat flux [W/m²]
     y_idx   : int  poloidal index of the target slice used
+    comp    : dict, only when ``components=True``
+        The electron/ion split and the factors that set it, all evaluated at
+        the plate and all already projected by Bp/B where that applies:
+
+        ``q_e``, ``q_i``           (x, zeta) [W/m²], ``q_e + q_i == q_local``
+        ``q_e_avg``, ``q_i_avg``   (x,) toroidal means
+        ``q_e_frac``              (x,) ``q_e_avg / q_avg`` — the "split"
+        ``gamma_e``, ``gamma_i``   (x, zeta) sheath transmission factors,
+                                   broadcast to arrays even in the fixed-3.5
+                                   fallback so a caller never special-cases
+        ``pv_e``, ``pv_i``         (x, zeta) ``P·|V|·(Bp/B)`` [W/m²] — the
+                                   channel WITHOUT γ, so a feature can be
+                                   attributed to γ or to P·V
+        ``Pe``, ``Pi``, ``Ve``, ``Vi``, ``Te_eV``, ``Ti_eV``, ``Bp_B``
+        ``phi``                    plate potential [V], or None when φ was not
+                                   passed (then γ is the fixed 3.5 fallback)
+        ``phi_over_Te``            (x, zeta) or None — the control parameter:
+                                   ``|V_e| ∝ exp(−(φ−φ_wall)/T_e)``, so this
+                                   is what decides which channel dominates
+
+        ``_avg`` entries are toroidal means of the product. Note
+        ``⟨γ⟩·⟨P·V⟩ ≠ ⟨γ·P·V⟩``: mean γ is a diagnostic, never a way to
+        rebuild the mean flux.
     """
     if Vi is None:
         ds = recover_target_ion_velocity(
@@ -492,11 +520,7 @@ def target_heat_flux_density(
     # metric when the poloidal field is not stored in the dataset.
     Bp_B  = _field_line_incidence(ds, pdim, i_dom)
 
-    # Electron density from pressure + temperature
-    # Te_eV = Pe/(n·e), but we can write q_{∥,e} = γ_e · Pe · |v_{∥e}|
-    # (since n·e·T_e = Pe when T_e is in eV = Pe already in Pa then Pe/e in eV·m^-3...)
-    # To avoid needing ne separately: n·e·T_e [Pa] = Pe [Pa] and n = Pe/(e·Te_eV)
-    # So γ·n·e·T·v = γ · Pe · v  directly.
+    # With pressure in Pa, gamma*n*e*T*|V| = gamma*P*|V|.
 
     # Te / Ti at the plate — used by both the φ-based γ form and the Stangeby
     # ρ-eq subtraction. Always derive once so both branches can see them.
@@ -512,6 +536,14 @@ def target_heat_flux_density(
         Ti_eV = at_sheath(Pi) / (_e * at_sheath(ds["Ni"]))
     else:
         Ti_eV = at_sheath(Pi) / (_e * 1e19)
+    # Plate densities, at the sheath like everything else. Taken from the dump
+    # where present; otherwise from P/(e·T), which is exact given the T above
+    # (and reproduces the 1e19 placeholder when neither N nor T was saved).
+    Ne_t = (at_sheath(ds["Ne"]) if "Ne" in ds
+            else at_sheath(Pe) / (_e * Te_eV.clip(min=1e-10)))
+    Ni_t = (at_sheath(ds[f"N{ion_species}"]) if f"N{ion_species}" in ds
+            else (at_sheath(ds["Ni"]) if "Ni" in ds
+                  else at_sheath(Pi) / (_e * Ti_eV.clip(min=1e-10))))
     m_i = AA_ion * _mp
 
     # NOTE: No Bohm cap on Vi_t / Ve_t. Hermes-3's `sheath_boundary_simple`
@@ -521,7 +553,7 @@ def target_heat_flux_density(
     # legitimate supersonic flow. Apparent M > 1 in time-averaged ⟨NV⟩/⟨N⟩
     # is either physical (sheath_boundary_simple with supersonic interior)
     # or a Favre-averaging artefact, distinguishable only with time-resolved
-    # data. The M_∥ diagnostic flags it for the user to interpret.
+    # data. The M_∥ diagnostic flags it for interpretation.
     if bohm_cap_v:
         import warnings
         warnings.warn(
@@ -553,10 +585,64 @@ def target_heat_flux_density(
     q_par_i = gamma_i * Pi_t * np.abs(Vi_t)   # [W/m²]
 
     # Project onto target surface normal: q_t = q_{∥,tot} · (Bp/B)
-    q_local = (q_par_e + q_par_i) * Bp_B      # [W/m²]
+    q_e     = q_par_e * Bp_B                  # [W/m²]
+    q_i     = q_par_i * Bp_B                  # [W/m²]
+    q_local = q_e + q_i                       # [W/m²]
     q_avg   = toroidal_mean(q_local, dim=zdim)
 
-    return q_local, q_avg, i_dom
+    if not components:
+        return q_local, q_avg, i_dom
+
+    # γ is a float in the fixed-3.5 fallback; broadcast so the caller never
+    # has to know which branch ran.
+    gam_e = gamma_e if isinstance(gamma_e, xr.DataArray) else xr.full_like(
+        Te_eV, float(gamma_e))
+    gam_i = gamma_i if isinstance(gamma_i, xr.DataArray) else xr.full_like(
+        Ti_eV, float(gamma_i))
+
+    q_e_avg = toroidal_mean(q_e, dim=zdim)
+    q_i_avg = toroidal_mean(q_i, dim=zdim)
+
+    comp = {
+        "q_e": q_e, "q_i": q_i,
+        "q_e_avg": q_e_avg, "q_i_avg": q_i_avg,
+        # The split. Guard a zero total (no plasma reaching a PFR cell).
+        "q_e_frac": q_e_avg / q_avg.where(q_avg != 0.0),
+        "gamma_e": gam_e, "gamma_i": gam_i,
+        "gamma_e_avg": toroidal_mean(gam_e, dim=zdim),
+        "gamma_i_avg": toroidal_mean(gam_i, dim=zdim),
+        # P·|V|·(Bp/B): the channel with γ divided out, so a feature in q can
+        # be attributed to the transmission factor or to the flow itself.
+        "pv_e": Pe_t * np.abs(Ve_t) * Bp_B,
+        "pv_i": Pi_t * np.abs(Vi_t) * Bp_B,
+        "Pe": Pe_t, "Pi": Pi_t, "Ve": Ve_t, "Vi": Vi_t,
+        "Te_eV": Te_eV, "Ti_eV": Ti_eV, "Bp_B": Bp_B,
+        # Plate plasma profiles. At the sheath (0.5*(domain+guard)), NOT the
+        # last domain cell, so they pair cell-for-cell with q_e/q_i above.
+        "Ne": Ne_t, "Ni": Ni_t,
+        "Ne_avg": toroidal_mean(Ne_t, dim=zdim),
+        "Ni_avg": toroidal_mean(Ni_t, dim=zdim),
+        "Te_eV_avg": toroidal_mean(Te_eV, dim=zdim),
+        "Ti_eV_avg": toroidal_mean(Ti_eV, dim=zdim),
+        "Pe_avg": toroidal_mean(Pe_t, dim=zdim),
+        "Pi_avg": toroidal_mean(Pi_t, dim=zdim),
+        # Ion saturation current density [A/m2] as a flush-mounted Langmuir
+        # probe collects it: the simulation's OWN parallel ion flux projected
+        # onto the plate, Z e N_i |V_i| (Bp/B). No assumed Bohm speed — V_i is
+        # whatever the sheath boundary condition produced, which is the point
+        # of comparing against LP data. Averaged as the product, because
+        # <N|V|> != <N><|V|>.
+        "jsat": Z_ion * _e * Ni_t * np.abs(Vi_t) * Bp_B,
+        "phi": phi_t if phi is not None else None,
+        # |V_e| ∝ exp(−(φ−φ_wall)/T_e): the measured control parameter of the
+        # e/i crossover (see findings_target.md).
+        "phi_over_Te": ((phi_t - phi_wall) / Te_eV.clip(min=0.01)
+                        if phi is not None else None),
+    }
+    for _k in ("pv_e", "pv_i", "jsat"):
+        comp[_k + "_avg"] = toroidal_mean(comp[_k], dim=zdim)
+
+    return q_local, q_avg, i_dom, comp
 
 
 def target_sheath_power_from_diagnostics(ds, y_target_idx, ion_species="i",
@@ -765,8 +851,8 @@ def get_midplane_y_indices(ds):
     ``imp``; for outer (LFS) targets map with ``omp``. In single-null there is a
     single SOL/midplane, so only ``omp`` is returned (use it for both targets).
 
-    Verified geometrically 2026-09-30 on the MAST-U SXD nx244/ny112, SXD
-    nx132/ny36 and CD ny96 grids: the index midpoint coincides with the
+    Verified geometrically on the MAST-U SXD nx244/ny112, SXD nx132/ny36 and
+    CD ny96 grids: the index midpoint coincides with the
     extremum of major radius on the separatrix to within one row, and `R·Bp`
     (hence the `dx/sqrt(g11)` radial scale) agrees to 1.0000 on all three.
     Note the grid file stores Rxy/Zxy WITH y-boundary guards when the grid was
@@ -900,7 +986,7 @@ def omp_mapped_distance(gridfile, target):
     the grid, so private-flux cells get their own ψ (s < 0), and mapped with
     `omp_midplane_distance`.
 
-    Replaces (2026-10-15) the old `(ds, y_target_idx, y_omp_idx)` version,
+    Replaces the `(ds, y_target_idx, y_omp_idx)` version,
     `s_target · B_target/B_mid`: a TOTAL-field ratio, which is ≈ R_mid/R_target
     for B ≈ B_t, not the poloidal flux expansion (R·Bp ratio) it was meant to
     be; and it took B_mid on the "midplane row", which on coarse ny is well off
@@ -1133,17 +1219,8 @@ def fit_eich(s_mm, q_MWm2, p0=None, bounds=None, sol_only=True, fit_s0=False):
     if not free_s0:
         params["s0"] = fixed_s0
 
-    # Integral power decay length. The PRIMARY definition (Loarte 1999) is
-    # λ_int = ∫(q − q_BG) dr / q_max, i.e. deposited power divided by peak heat
-    # flux; `integral_width()` evaluates that directly from the data. What is
-    # computed here is Makowski's closed-form approximation to it in terms of
-    # the Eich fit parameters,
-    #
-    #     λ_int ≈ λ_q + 1.64·S            (Eich 2013 NF 53 093031, §2)
-    #
-    # good to <4 % for S/λ_q < 10. NOTE the coefficient multiplies S, not S/2
-    # — this previously carried a spurious factor 1/2, which under-reported
-    # λ_int by ~36 % at a typical S/λ_q ≈ 0.7.
+    # Eich approximation: lambda_int = lambda_q + 1.64*S (Eich 2013, section 2).
+    # integral_width() evaluates the background-subtracted profile directly.
     params["lambda_int"] = params["lambda_q"] + 1.64 * params["S"]
     params["lambda_int_valid"] = bool(params["S"] / max(params["lambda_q"], 1e-30) < 10)
 
@@ -1213,7 +1290,7 @@ def fit_double_exp(s_mm, q_MWm2, p0=None, bounds=None, s_min=0.0, fit_s0=False):
              the strike point can sit anywhere ≥ s_min, so set s_min to be
              generous (e.g. −5 mm) if you expect a shifted peak.
     fit_s0 : bool or float
-        False (default) → s0 fixed at 0 (peak at the magnetic separatrix).
+        False (default) → s0 fixed at the magnetic separatrix (0).
         True            → s0 is added as a free 6th parameter. **Required** if
         the q-peak sits well inside the SOL — without it the fit tries to
         match a rising-then-falling shape with a monotonically decaying model
@@ -1247,10 +1324,7 @@ def fit_double_exp(s_mm, q_MWm2, p0=None, bounds=None, s_min=0.0, fit_s0=False):
     s_peak = float(s[i_peak])
 
     if p0 is None:
-        # Seed the near/far scales from the inner/outer log-slopes of the fitted
-        # side rather than a fixed 1.5/8 mm — the fixed seed lands in a bad local
-        # minimum on genuinely two-scale profiles (the failure seen fitting
-        # fall-off lengths), collapsing the near scale onto its bound.
+        # Initialise near/far scales from the profile slopes to improve optimisation.
         def _seed_lam(mask):
             if mask.sum() >= 3 and np.all(q[mask] > 0):
                 sl = np.polyfit(s[mask], np.log(q[mask]), 1)[0]
@@ -1325,24 +1399,13 @@ def fit_double_exp(s_mm, q_MWm2, p0=None, bounds=None, s_min=0.0, fit_s0=False):
 
 def total_target_power(ds, q_target_avg, y_target_idx, zperiod=None,
                        exclude_xguards=True):
-    """
-    Integrate toroidal-mean heat flux over the target plate: total power [W].
+    """Integrate toroidal-mean target heat flux to obtain total deposited power [W].
 
-        P = 2π · ∫ q_target · sqrt(g_{xx}·g_{ζζ} − g_{xζ}²) dx
+        P = 2*pi * integral(q_target * sqrt(g_xx*g_zz - g_xz**2) dx)
 
-    where 2π covers the full torus and sqrt(g_{xx}·g_{ζζ} − g_{xζ}²)·dx is
-    the area element per unit toroidal angle at the target [m²/rad].
-
-    **The x-guard cells are excluded by default, and this matters a lot.**
-    They lie outside the physical radial domain, so they carry no wetted plate
-    area — but on a mesh that expands outward they dominate the area element:
-    measured on `sxd_MU/nx32_ny32_45456`, the two high-x guard cells alone hold
-    **21.8 %** of the outer targets' total `poloidal_area_element_dx` (and 12.3 %
-    on the inner targets). Including them inflated the total power by ~19 % on
-    the outer targets, which is exactly what the comparison against Hermes-3's
-    own `E<sp>_sheath` diagnostic exposed — the ratio went from 1.18–1.20 to
-    ~1.0 once they were dropped. `target_poloidal_check.py` already excluded
-    them; this function was the inconsistent one.
+    The area element is per unit toroidal angle; 2*pi covers the full torus.
+    Radial guard cells are excluded by default because they lie outside the
+    physical target surface.
 
     Parameters
     ----------
@@ -1357,7 +1420,7 @@ def total_target_power(ds, q_target_avg, y_target_idx, zperiod=None,
                      toroidal integral regardless of zperiod.
     exclude_xguards : bool
                      Drop `MXG` cells at each radial end (default True). Set
-                     False only to reproduce the pre-2026-10-05 behaviour.
+                     False only to reproduce an old number.
 
     Returns
     -------

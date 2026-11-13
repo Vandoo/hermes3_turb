@@ -6,7 +6,10 @@ Parses slurm-*.out files within a given job-ID range to extract:
   - Simulation time range (first and last sim time on data lines)
   - Wall-clock run time (from "Run time : Xh Xm Xs")
   - Computing speed = delta_sim_time / run_time_seconds
-    where delta_sim_time = sim_end - sim_start (physics time covered per job)
+    where delta_sim_time = sim_end - sim_start (physics time covered per job).
+    If the logged dump_on_restart=false, sim_start is reconstructed by
+    subtracting the logged output interval from the first printed time.
+    Logs without that setting retain the first-printed-time convention.
 
 The sim-time BOUT++ prints is **normalised** (units of 1/Omega_ci).  This script
 also converts it to physical time, the same way h2time_hermes.py does:
@@ -14,15 +17,13 @@ also converts it to physical time, the same way h2time_hermes.py does:
     t_physical [s] = t_normalised / Omega_ci        Omega_ci = qe*Bnorm/Mp
 
 Note Hermes-3 defines Omega_ci with the **proton** mass and no AA factor
-(hermes-3.cxx:196), so a deuterium case does NOT get an extra 1/2 - assuming it
-does is the 6.6x error that was once baked into h2time_hermes.py.  Omega_ci is
-therefore read from the dump (or derived from Bnorm) rather than hard-coded; if
+(hermes-3.cxx:196). Omega_ci is read from the dump or derived from Bnorm; if
 it cannot be found the physical-time columns are omitted instead of guessed.
 
 Two extra columns and a "real time" summary are reported:
   - dt [us]   : physical time covered by that job
   - us/day    : physical microseconds simulated per day of wall clock,
-                the practical "how long until this run is useful?" number
+                simulation throughput
 
 Usage:
     python parse_slurm_speed.py --start 613958 --end 669679 [--dir /path/to/logs]
@@ -53,6 +54,7 @@ import glob
 import os
 import argparse
 import statistics
+import math
 
 # ── Physical constants (SI, as used by Hermes-3) ──────────────────────────────
 QE = 1.602176634e-19   # elementary charge [C]
@@ -64,7 +66,7 @@ def omega_ci_from_bnorm(bnorm):
 
     Deliberately no AA factor - Hermes-3 normalises with the proton mass whatever
     the ion species. Dividing by AA here would slow every reported physical time
-    by that factor (the 6.6x bug that once lived in h2time_hermes.py).
+    by that factor — 6.6x for deuterium.
     """
     return QE * bnorm / MP
 
@@ -231,7 +233,39 @@ def parse_file(filepath, omega_ci=None):
     if run_time_s == 0:
         raise ValueError("Run time is zero — cannot compute speed")
 
-    sim_start = sim_times[0]
+    # BOUT++ omits the initial monitor call when dump_on_restart=false,
+    # including on a fresh run. The first printed time is then one output
+    # interval after the actual start. Use the options logged for THIS job,
+    # never today's BOUT.inp or the previous job (which may overlap/gap).
+    first_printed_sim = sim_times[0]
+    sim_start = first_printed_sim
+    start_source = "first printed time (initial-output setting unknown)"
+    dump_flags = re.findall(
+        r"^\s*Option dump_on_restart = (true|false|1|0)\b", content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    omitted_initial_interval = bool(dump_flags and
+                                    dump_flags[-1].lower() in ("false", "0"))
+    if omitted_initial_interval:
+        # The runtime announcement is the final effective output interval,
+        # including modern solver:output_step and legacy timestep options.
+        intervals = re.findall(
+            r"output timestep of ([0-9.eE+\-]+)", content,
+        )
+        if not intervals:
+            intervals = re.findall(
+                r"^\s*Option (?:solver:output_step|timestep) = "
+                r"([0-9.eE+\-]+)\b", content, re.MULTILINE,
+            )
+        if not intervals:
+            raise ValueError("Initial output omitted but output timestep is missing")
+        output_interval = float(intervals[-1])
+        if not math.isfinite(output_interval) or output_interval <= 0:
+            raise ValueError("Initial output omitted but output timestep is invalid")
+        sim_start -= output_interval
+        start_source = "first printed time minus logged output timestep"
+    elif dump_flags:
+        start_source = "first printed time (initial output included)"
     sim_end   = sim_times[-1]
     delta_sim = sim_end - sim_start
 
@@ -245,6 +279,9 @@ def parse_file(filepath, omega_ci=None):
         "filename"    : os.path.basename(filepath),
         "job_id"      : job_id,
         "sim_start"   : sim_start,
+        "first_printed_sim": first_printed_sim,
+        "start_source": start_source,
+        "omitted_initial_interval": omitted_initial_interval,
         "sim_end"     : sim_end,
         "delta_sim"   : delta_sim,   # normalised time covered this job
         "run_time_s"  : run_time_s,
@@ -455,6 +492,9 @@ def main():
         try:
             r = parse_file(fp, omega_ci=omega_ci)
             results.append(r)
+            if r["omitted_initial_interval"]:
+                print(f"  {r['filename']}: initial output omitted; "
+                      "restored one logged output interval")
             row = [
                 r["filename"],
                 r["job_id"],

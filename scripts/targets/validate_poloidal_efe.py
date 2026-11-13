@@ -8,7 +8,14 @@ principles and compared, channel by channel, with the code's diagnostic:
 
     advection   (5/2) P V              ↔  ef e_adv_ylow
     conduction  −κ_∥ ∂T/∂s_∥           ↔  ef e_cond_ylow
-    total       advection + conduction ↔  ef e_tot_ylow
+    total       advection + conduction ↔  ef e_adv_ylow + ef e_cond_ylow
+
+The total is compared against `adv + cond`, NOT against `ef<sp>_tot_ylow`.
+`evolve_pressure` adds `flow_ylow_viscous_heating` to the published total
+outside the guard that applies that heating to `ddt(P)`
+(`evolve_pressure.cxx:317-328`), and `numerical_viscous_heating` defaults to
+false, so on a `diagnose = true` run `ef<sp>_tot_ylow` carries a channel that
+is in no equation. This script prints that leftover explicitly.
 
 Face-flow forms (BOUT++ field-aligned coords, y = parallel coordinate):
     perpendicular face area     A_⊥ = (J/√g_22)·dx·dz
@@ -65,6 +72,7 @@ nx, ny = ds.sizes["x"], ds.sizes[pdim]
 adv_name  = f"ef{species}_adv_ylow"
 cond_name = f"ef{species}_cond_ylow"
 tot_name  = f"ef{species}_tot_ylow"
+visc_name = f"ef{species}_visc_heat_ylow"
 for nm in (adv_name, cond_name, tot_name):
     if nm not in dsa:
         print(f"WARNING: '{nm}' not in dataset — that channel will be skipped.")
@@ -137,7 +145,13 @@ def native(name):
         return np.full(ny, np.nan)
     return sum_face(arr(name)) / 1e3
 
-adv_nat, cond_nat, tot_nat = native(adv_name), native(cond_name), native(tot_name)
+adv_nat, cond_nat = native(adv_name), native(cond_name)
+visc_nat, published = native(visc_name), native(tot_name)
+# The reference for "total" is what evolve_pressure actually integrates:
+# advection + conduction. ef*_tot_ylow is the PUBLISHED total and may carry
+# the numerical viscous heating on top (see the module docstring).
+tot_nat = adv_nat + np.nan_to_num(cond_nat)
+leftover = published - tot_nat
 
 # ── Report agreement over the "clean" domain ─────────────────────────────────
 # A single global FFT field-aligned shift is invalid across topological branch
@@ -165,13 +179,39 @@ for label, mine, nat in [("advection", adv_mine, adv_nat),
     print(f"{label:<12}{ratio:>22.3f}{absdif:>24.3f}")
 print("=" * 72)
 print("clean = y-domain faces excluding |cond_native| > 5×median (X-point/crash spikes)")
+print("'total' is compared against adv+cond, NOT against the published "
+      f"{tot_name}.")
+
+# ── What the published total carries beyond adv + cond ───────────────────────
+if np.isfinite(published).any():
+    m = clean & np.isfinite(leftover)
+    peak = np.nanmax(np.abs(leftover[m])) if m.any() else 0.0
+    frac = 100.0 * peak / max(np.nanmax(np.abs(tot_nat[m])) if m.any() else 1.0, 1e-30)
+    if peak > 1e-6:
+        print(f"\n{tot_name} − (adv + cond): peak {peak:.3f} kW per face "
+              f"({frac:.1f} % of the largest adv+cond face)")
+        if np.isfinite(visc_nat).any():
+            vpk = np.nanmax(np.abs(visc_nat[m])) if m.any() else 0.0
+            print(f"  that is {visc_name}, peak {vpk:.3f} kW per face.")
+        print("  evolve_pressure publishes the numerical viscous heating inside "
+              "the total even\n  when numerical_viscous_heating=false (its "
+              "default) keeps it out of ddt(P).\n  Exclude it from any pressure "
+              "budget: use h3t.parallel_energy_flow_ylow().")
+    else:
+        print(f"\n{tot_name} == adv + cond to {peak:.1e} kW — nothing extra "
+              "published on this run.")
 
 # ── Plot mine vs native for each channel ─────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
 for ax, (label, mine, nat) in zip(axes, [("advection", adv_mine, adv_nat),
                                          ("conduction", cond_mine, cond_nat),
                                          ("total", tot_mine, tot_nat)]):
-    ax.plot(yint[domain], nat[domain], "ks-", ms=4, label=f"ef{species}_{label[:3]}_ylow")
+    nat_label = (f"ef{species}_adv_ylow + ef{species}_cond_ylow"
+                 if label == "total" else f"ef{species}_{label[:3]}_ylow")
+    ax.plot(yint[domain], nat[domain], "ks-", ms=4, label=nat_label)
+    if label == "total" and np.isfinite(published).any():
+        ax.plot(yint[domain], published[domain], ":", color="0.55", lw=1.2,
+                label=f"{tot_name} (published)")
     ax.plot(yint[domain], mine[domain], "r.-", label="from definitions")
     ax.set_xlabel("poloidal index y (face)")
     ax.set_ylabel("power through Y face [kW]")

@@ -142,61 +142,19 @@ def magnetic_drift_radial_velocity(ds, T_eV, bxcvx, Bxy):
 
 
 def diamagnetic_work_radial_flux(ds, phi, P_charged, bxcvx, Bxy):
-    """
-    Radial flux density of the **diamagnetic work term** [W/m²].
+    """Calculate the radial diamagnetic-work flux density [W/m²].
 
-        W   = φ · P_charged · ∇×(b/B)
-        W_r = φ · P_charged · 2·bxcvx / (B · √g11)
+        W_r = phi * P_charged * 2*bxcvx/(B*sqrt(g11))
 
-    This is the boundary flux that the pair of volume terms in Dudson et al.
-    2026 (Nucl. Fusion 66 036015) eqs. (B.9)→(B.10) collapses to:
+    This is the boundary flux associated with
+    -phi*div(P*C) - P*C.grad(phi) = -div(phi*P*C), where C = curl(b/B).
+    See Dudson 2026, Nuclear Fusion 66, 036015, eqs. B.9-B.10.
 
-        −φ ∇·(P ∇×(b/B))  −  P ∇×(b/B)·∇φ  =  −∇·(φ P ∇×(b/B))
-
-    The **second** volume term is exactly what Hermes-3 applies to the species
-    energy source — `vorticity.cxx:599`,
-    ``subtract(species["energy_source"], Jdia_species * Grad(phi))`` with
-    ``Jdia_species = P * Curlb_B`` — and the **first** is the diamagnetic drive
-    of the vorticity equation (``ddt(Vort) += Div(Jdia)``). Together they are
-    the channel that exchanges species *thermal* energy with *perpendicular
-    flow* energy, i.e. one of the two routes into the ⊥KE reservoir that
-    Dudson 2026 §5 finds is fed at 27.5 kW and never returned. ``W_r`` is the
-    part of that channel which leaves through a flux surface instead of
-    staying in the domain, so it is one of the "transport of perpendicular ion
-    kinetic energy through the boundaries" diagnostics the paper notes "have
-    not yet been implemented".
-
-    Unlike the advected ⊥KE (which is negligible — see the reservoir ratio in
-    ``v3_plasma_balance.py``), this is a **work** term: potential × current,
-    not energy density × velocity. It therefore does not scale with the ⊥KE
-    density and is not bounded by it.
-
-    Conventions
-    -----------
-    ``Curlb_B = ∇×(b/B) = 2·bxcv/B`` is the Hermes-3 definition
-    (``braginskii_ion_viscosity.cxx:108–112``: ``bxcv`` is read from the grid,
-    rescaled, then ``*= 2./Bxy``). The physical radial component is
-    ``(Curlb_B)^x/√g11``, which is the *same* factor
-    ``2·bxcvx/(Bxy·√g11)`` already used by
-    :func:`radial_magnetic_drift_particle_flux` — so the normalisation rides on
-    the validated magnetic-drift path. ``bxcvx``/``Bxy`` must come from
-    :func:`hermes3_turb.load.load_grid_vars` in the dataset's own
-    normalisation (see [[bug-poloidal-magdrift]]).
-
-    Integrating ``W_r`` with :func:`hermes3_turb.balance.radial_flux_profile`
-    gives ``∫W^x J dy dz`` exactly, because
-    ``√(g_22·g_33 − g_23²) = J·√g11`` for these metrics.
-
-    Sign: positive = outward (increasing x). The volume term is ``−∇·W``, so
-    energy **leaving** through a surface of outward normal n̂ is ``+∮W·n̂dS``.
-
-    ⚠ **Gauge.** W contains φ itself, not only ∇φ, so the *split* between the
-    volume and boundary parts of this channel depends on the zero of φ (a
-    shift φ→φ+c moves ``c·∮P∇×(b/B)·dS`` between them; the total is
-    unchanged). Hermes-3 fixes the gauge physically by floating φ against
-    ``phi_wall`` at the sheath, so the number is meaningful — but it moves if
-    ``phi_wall`` is non-zero or the core-boundary φ relaxation shifts the
-    level, and it is not comparable across runs with different φ references.
+    Use load_grid_vars to obtain curvature and field in the dataset's
+    normalisation. radial_flux_profile integrates this density over a surface;
+    positive flux is outward. This work term is distinct from advected kinetic
+    energy. Its separation into volume and boundary terms depends on the
+    potential reference, so comparisons require matching phi conventions.
 
     Parameters
     ----------
@@ -509,14 +467,24 @@ def radial_particle_flux(ds, n, phi, include_y_derivs=True):
     return n * ExB_radial_velocity(ds, phi, include_y_derivs=include_y_derivs)
 
 
-def radial_heat_flux(ds, P, phi, include_y_derivs=True):
-    """
-    Radial ExB enthalpy (heat) flux density: q_r = (5/2) P · v_ExB_r  [Wm⁻²].
+EXB_ENERGY_COEFF = 1.5
+"""Energy per unit pressure in the perpendicular ExB channel.
 
-    From the Hermes-3 pressure equation (eq. 2/8 in the physics PDF), the
-    convective energy flux carried by the ExB drift is (5/2) P · v_E.
-    The factor 5/2 = 3/2 (internal energy) + 1 (PdV work) = enthalpy flux
-    for an ideal gas.
+Hermes-3 advects pressure with -Div_n_bxGrad_f_B_XPPM(P, phi, ...),
+so its internal-energy flux is (3/2)*P*v_E (evolve_pressure.cxx).
+Parallel advection, diamagnetic drift, and magnetic flutter use 5/2;
+anomalous diffusion uses 3/2. Those coefficients are set separately.
+Pass coefficient=2.5 explicitly to request the enthalpy form.
+"""
+
+
+def radial_heat_flux(ds, P, phi, include_y_derivs=True,
+                     coefficient=EXB_ENERGY_COEFF):
+    """
+    Radial ExB energy flux density: q_r = c · P · v_ExB_r  [Wm⁻²], c = 3/2.
+
+    See :data:`EXB_ENERGY_COEFF` for why this channel is 3/2 and not the 5/2
+    enthalpy coefficient used for the parallel and diamagnetic channels.
 
     Parameters
     ----------
@@ -527,12 +495,15 @@ def radial_heat_flux(ds, P, phi, include_y_derivs=True):
         Electrostatic potential [V].
     include_y_derivs : bool, default True
         Forwarded to :func:`ExB_radial_velocity`; see its docstring.
+    coefficient : float, default 3/2
+        Energy per unit pressure. Pass 2.5 only to reproduce an old number.
 
     Returns
     -------
     xarray.DataArray  [Wm⁻²]
     """
-    return 2.5 * P * ExB_radial_velocity(ds, phi, include_y_derivs=include_y_derivs)
+    return coefficient * P * ExB_radial_velocity(
+        ds, phi, include_y_derivs=include_y_derivs)
 
 
 def decompose_radial_particle_flux(ds, n, phi, zdim=None, include_y_derivs=True):
@@ -590,16 +561,19 @@ def decompose_radial_particle_flux(ds, n, phi, zdim=None, include_y_derivs=True)
     return Gamma_mean, Gamma_turb, Gamma_total
 
 
-def decompose_radial_heat_flux(ds, P, phi, zdim=None, include_y_derivs=True):
+def decompose_radial_heat_flux(ds, P, phi, zdim=None, include_y_derivs=True,
+                               coefficient=EXB_ENERGY_COEFF):
     """
     Decompose the radial enthalpy flux into mean-flow and turbulent parts.
 
     Mean is the full ensemble average over ζ and (if present) time, the same
     convention as decompose_radial_particle_flux:
 
-      q_total = (5/2) <<P · v_ExB_r>_ζ>_t
-      q_mean  = (5/2) <<P>_ζ>_t · <<v_ExB_r>_ζ>_t
+      q_total = c <<P · v_ExB_r>_ζ>_t
+      q_mean  = c <<P>_ζ>_t · <<v_ExB_r>_ζ>_t
       q_turb  = q_total − q_mean
+
+    with c = 3/2 — see :data:`EXB_ENERGY_COEFF`.
 
     Parameters
     ----------
@@ -612,6 +586,8 @@ def decompose_radial_heat_flux(ds, P, phi, zdim=None, include_y_derivs=True):
         Toroidal dimension name. Auto-detected if not given.
     include_y_derivs : bool, default True
         Forwarded to :func:`ExB_radial_velocity`; see its docstring.
+    coefficient : float, default 3/2
+        Energy per unit pressure. Pass 2.5 only to reproduce an old number.
 
     Returns
     -------
@@ -628,8 +604,8 @@ def decompose_radial_heat_flux(ds, P, phi, zdim=None, include_y_derivs=True):
         da = toroidal_mean(da, dim=zdim)
         return da.mean("t") if "t" in da.dims else da
 
-    q_total = 2.5 * avg(P * v_r)
-    q_mean  = 2.5 * avg(P) * avg(v_r)
+    q_total = coefficient * avg(P * v_r)
+    q_mean  = coefficient * avg(P) * avg(v_r)
     q_turb  = q_total - q_mean
 
     return q_mean, q_turb, q_total
@@ -864,7 +840,11 @@ def total_poloidal_heat_flux(ds, P, v_par, phi, zdim=None):
     """
     Total toroidal-mean poloidal heat flux including parallel flow and ExB.
 
-    q_pol_total = (5/2) P · (v_{∥,pol} + v_ExB_pol)
+    q_pol_total = (5/2) P v_{∥,pol}  +  (3/2) P v_ExB_pol
+
+    The two channels carry DIFFERENT coefficients: the parallel advective flow
+    is 5/2 (``evolve_pressure.cxx:307``) and the perpendicular ExB flow is 3/2
+    (see :data:`EXB_ENERGY_COEFF`).
 
     Parameters
     ----------
@@ -882,5 +862,5 @@ def total_poloidal_heat_flux(ds, P, v_par, phi, zdim=None):
         zdim = detect_toroidal_dim(ds)
 
     q_par = 2.5 * P * parallel_to_poloidal(ds, v_par)
-    q_exb = 2.5 * P * ExB_poloidal_velocity(ds, phi)
+    q_exb = EXB_ENERGY_COEFF * P * ExB_poloidal_velocity(ds, phi)
     return toroidal_mean(q_par + q_exb, dim=zdim)

@@ -1,4 +1,4 @@
-"""Synthetic regressions for the 2026-10-27 review; no simulation files needed."""
+"""Synthetic regressions; no simulation files needed."""
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,8 +74,7 @@ def test_cache_preserves_existing_names_when_folders_become_available(tmp_path):
     (tmp_path/'2/boutdata.nc').touch()
     after = h3t.existing_dirs(str(tmp_path), [1, 2, 3])
     new_cache = h3t.cache_path('flux', after, cache_dir=tmp_path/'cache')
-    # Retain the historical name for cross-machine and hand-written paths.
-    # After filling a gap, the user must set use_cache=False to recompute.
+    # Cache names remain stable across machines; recompute after filling missing folders.
     assert old_cache == new_cache
     assert new_cache.name == 'flux_dirs1-3.npz'
     assert h3t.load_cache(new_cache)['value'] == 42

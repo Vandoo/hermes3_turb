@@ -7,13 +7,15 @@ opt_plt options:
   time_var          — plot max/min of each variable over all saved timesteps
   field_aligned_var — convert variables to field-aligned coords, report max/min/location
   crash_seed        — localise critically-low / negative density (crash seed)
-  inventory_time    — n_sep / particle inventory / min(Ne) across folders (depletion?)
+  inventory_time    — across folders: n_sep, particle inventory, min(Ne), and the
+                      |phi|max, min Ne/Te per divertor leg, and max Te
   precon_coef       — conduction-precon κ/N conditioning (zero-pivot risk)
   neutral_diff      — neutral perp-diffusion stiffness (Dnn/Δ⊥²)
   field_autopsy     — per-flux-region field post-mortem: density contrast (EM Apar
                       Naulin risk), pressure blow-up, T=P/N excursions, and WHERE
   stiffness_map     — WHERE/HOW HARD the accuracy limit caps dt (local-error weight
                       map from saved ddt(*)) + 3-D structure probe at the worst cells
+                      Also prints |phi|max, max Te and the per-leg Ne/Te minima per frame.
   log_autopsy       — classify a failure from BOUT.log.* : which solver failed +
                       CVODE trajectory → timeout / Newton-collapse / divergence / first-step
 
@@ -273,6 +275,17 @@ elif opt_plt == "crash_seed":
 # numbered output folders (auto-discovered) to see whether the run is settling
 # to its tuned steady state or draining. A flat n_sep at the target + a levelling
 # SOL inventory = healthy; a monotonic drain = depleting.
+#
+# Also prints the run-health metrics per folder: |phi|max (~1-3 healthy; a RISING
+# trajectory is the polarisation_drift runaway, judged on the trend and not the
+# endpoint), max Te, and min Ne / min Te in each divertor leg (~3e14 m^-3 = an
+# empty leg, i.e. no sheath sink -> density/power runaway).
+#
+# Only each folder's LAST frame is used, so the `dump_at_restart` copy that
+# opens every folder is never counted twice — no de-duplication needed. Legs
+# are kept separate: in a double null the four are physically disconnected, and
+# a single lumped minimum hides which one is emptying. x-guards and the
+# y-boundary guard rows are dropped before any minimum or integral.
 # ---------------------------------------------------------------------------
 elif opt_plt == "inventory_time":
     import glob
@@ -316,20 +329,80 @@ elif opt_plt == "inventory_time":
         nsep = float(Ne[ix1, yomp, :].mean()) * Nn
         minNe = float(np.nanmin(np.where(dom[:, :, None], Ne, np.nan))) * Nn
         tms = (float(np.array(d["t_array"][-1])) / Om * 1e3) if "t_array" in d.variables else np.nan
+
+        # Divertor-leg mask, per folder (jyseps can differ between grids).
+        # Same guard convention as stiffness_map: +g below ny_inner, +3g above.
+        j11 = int(d["jyseps1_1"][...]); j21 = int(d["jyseps2_1"][...])
+        j12 = int(d["jyseps1_2"][...]); j22 = int(d["jyseps2_2"][...])
+
+        def _reg(y, g=g, nyi=nyi, j11=j11, j21=j21, j12=j12, j22=j22):
+            yy = y - g if y < nyi + g else y - 3 * g
+            if yy <= j11:  return "inner-lower leg"
+            if yy <= j21:  return "inner core/SOL"
+            # <= j12: see the note on stiffness_map's region_of
+            if yy <= j12:  return "upper-inner leg" if yy < nyi else "upper-outer leg"
+            if yy <= j22:  return "outer core/SOL"
+            return "outer-lower leg"
+
+        leg_y = {}
+        for y in range(nyf):
+            if ym[y] and _reg(y).endswith("leg"):
+                leg_y.setdefault(_reg(y), []).append(y)
+        xin, xout = MXG, nxf - MXG
+
+        if leg_y:
+            minNe_leg = min(float(np.nanmin(Ne[xin:xout][:, ys]))
+                            for ys in leg_y.values()) * Nn
+            worst = min(leg_y, key=lambda rg:
+                        float(np.nanmin(Ne[xin:xout][:, leg_y[rg]])))
+        else:
+            minNe_leg, worst = np.nan, "(no legs)"
+
+        if "Te" in d.variables:
+            Tn = float(d["Tnorm"][...])
+            Te = np.array(d["Te"][:]); Te = Te[-1] if Te.ndim == 4 else Te
+            maxTe = float(np.nanmax(np.where(dom[:, :, None], Te, np.nan))) * Tn
+            minTe_leg = (min(float(np.nanmin(Te[xin:xout][:, ys]))
+                             for ys in leg_y.values()) * Tn) if leg_y else np.nan
+        else:
+            maxTe = minTe_leg = np.nan
+
+        if "phi" in d.variables:
+            ph = np.array(d["phi"][:]); ph = ph[-1] if ph.ndim == 4 else ph
+            phimax = float(np.nanmax(np.where(dom[:, :, None], np.abs(ph), np.nan)))
+        else:
+            phimax = np.nan
+
         rows.append([int(os.path.basename(folder)), tms, nsep,
-                     inv(dom), inv(core), inv(sol), minNe])
+                     inv(dom), inv(core), inv(sol), minNe,
+                     phimax, maxTe, minTe_leg, minNe_leg, worst])
         d.close()
 
     rows.sort(key=lambda r: (r[1] if np.isfinite(r[1]) else r[0]))
-    a = np.array(rows, float)
+    a = np.array([r[:-1] for r in rows], float)   # last column is the leg NAME
     print(f"{'dir':>5}{'t[ms]':>9}{'n_sep[m^-3]':>14}{'I_tot':>12}{'I_core':>12}"
-          f"{'I_SOL':>12}{'minNe[m^-3]':>14}")
+          f"{'I_SOL':>12}{'minNe[m^-3]':>14}{'|phi|max':>10}{'maxTe':>8}"
+          f"{'minTe_leg':>10}{'minNe_leg':>12}  emptiest leg")
     for r in rows:
         print(f"{int(r[0]):>5}{r[1]:>9.3f}{r[2]:>14.3e}{r[3]:>12.3e}{r[4]:>12.3e}"
-              f"{r[5]:>12.3e}{r[6]:>14.3e}")
+              f"{r[5]:>12.3e}{r[6]:>14.3e}{r[7]:>10.3f}{r[8]:>8.1f}"
+              f"{r[9]:>10.4f}{r[10]:>12.3e}  {r[11]}")
+
+    # |phi|max trajectory is the earliest warning of the polarisation_drift
+    # runaway and it LEADS Te by ~50 time units, so a flat Te with |phi|max
+    # already climbing is not reassurance.
+    if len(a) > 2 and np.isfinite(a[:, 7]).all():
+        sl = np.polyfit(a[:, 1], a[:, 7], 1)[0]
+        print(f"\n  |phi|max {a[0, 7]:.2f} -> {a[-1, 7]:.2f} "
+              f"(slope {sl:+.2f} per ms); healthy is ~1-3, judge the TREND.")
+    if len(a) > 2 and np.isfinite(a[:, 10]).all():
+        sl = np.polyfit(a[:, 1], a[:, 10], 1)[0]
+        print(f"  min Ne leg {a[0, 10]:.3e} -> {a[-1, 10]:.3e} "
+              f"(slope {sl:+.3e} m^-3/ms); ~3e14 = empty, no sheath sink.")
 
     t = a[:, 1]
-    fig, ax = plt.subplots(1, 3, figsize=(15, 4.2))
+    fig, ax = plt.subplots(2, 3, figsize=(15, 8.4))
+    ax = ax.ravel()
     ax[0].plot(t, a[:, 2], "o-")
     ax[0].axhline(N_TARGET, color="r", ls="--", label=f"target {N_TARGET:.0e}")
     ax[0].set(xlabel="t [ms]", ylabel="n_sep [m$^{-3}$]", title="separatrix density (OMP)")
@@ -341,6 +414,21 @@ elif opt_plt == "inventory_time":
     ax[1].legend()
     ax[2].semilogy(t, np.clip(a[:, 6], 1e10, None), "o-")
     ax[2].set(xlabel="t [ms]", ylabel="min domain Ne [m$^{-3}$]", title="min density")
+    ax[3].plot(t, a[:, 7], "o-")
+    ax[3].axhspan(1.0, 3.0, color="g", alpha=0.15, label="healthy 1-3")
+    ax[3].set(xlabel="t [ms]", ylabel="|phi|$_{max}$ [norm]",
+              title="polarisation-drift runaway check")
+    ax[3].legend()
+    ax[4].semilogy(t, np.clip(a[:, 10], 1e10, None), "o-")
+    ax[4].axhline(3e14, color="r", ls="--", label="3e14 = empty leg")
+    ax[4].set(xlabel="t [ms]", ylabel="min Ne over legs [m$^{-3}$]",
+              title="divertor-leg density")
+    ax[4].legend()
+    ax[5].plot(t, a[:, 8], "o-", label="max Te (domain)")
+    ax[5].plot(t, a[:, 9], "s-", label="min Te (legs)")
+    ax[5].set(xlabel="t [ms]", ylabel="Te [eV]", yscale="log",
+              title="electron temperature range")
+    ax[5].legend()
     fig.tight_layout()
     plt.show()
 
@@ -728,7 +816,13 @@ elif opt_plt == "stiffness_map":
         yy = y - g if y < nyi + g else y - 3 * g
         if yy <= j11:  return "inner-lower leg"
         if yy <= j21:  return "inner core/SOL"
-        if yy <  j12:  return "upper-inner leg" if yy < nyi else "upper-outer leg"
+        # <= j12, NOT < j12: jyseps1_2 is the LAST row of the outer-upper leg
+        # (xhermes/selectors.py:195 slice(ny_innerg, j1_2g+1), and :187 starts
+        # the outer core at j1_2g+1). The strict < mis-assigned that one row to
+        # "outer core/SOL", shrinking the upper-outer leg by a row in every
+        # region table and leg minimum. Single null is unaffected: j21 == j12
+        # there, so the previous test catches it first.
+        if yy <= j12:  return "upper-inner leg" if yy < nyi else "upper-outer leg"
         if yy <= j22:  return "outer core/SOL"
         return "outer-lower leg"
 
@@ -741,7 +835,7 @@ elif opt_plt == "stiffness_map":
 
     # |phi|max per frame. A polarisation_drift blowup drags the stiffness
     # maximum out of the divertor and into the core, so the map is only telling
-    # you about the *divertor* while phi is still healthy (~1-2, Dudson).
+    # the divertor state while phi remains bounded (~1-2, Dudson).
     if "phi" in ds.variables:
         pm = np.array([np.nanmax(np.where(dom, np.abs(np.array(ds["phi"][k])), np.nan))
                        for k in range(nt)])
@@ -749,6 +843,17 @@ elif opt_plt == "stiffness_map":
         print("  |phi|max per frame: "
               + "  ".join(f"{v:.1f}" + ("*" if k == (FRAME % nt) else "")
                           for k, v in enumerate(pm)))
+        # Two different thresholds, deliberately. The potential health band is
+        # ~1-3; the 5.0 below is the stricter "the core phi runaway now swamps
+        # ddt and will MASK the divertor in the map" level. Between them the
+        # run is already unhealthy but the map is still readable, so say so
+        # rather than stay silent — judge the TREND, not the endpoint.
+        if 3.0 < sel <= 5.0:
+            trend = (np.polyfit(t_arr, pm, 1)[0] * 1e3) if nt > 2 else float("nan")
+            print(f"  ** |phi|max = {sel:.2f} is ABOVE the healthy 1-3 band "
+                  f"(trend {trend:+.2f} per 1000 t-units over this dump). **")
+            print( "  ** Rising across folders = polarisation_drift runaway; check "
+                   "inventory_time for the trajectory. **")
         if sel > 5.0:
             first_ok = next((k for k in range(nt) if pm[k] <= 5.0), None)
             print(f"  ** WARNING: |phi|max = {sel:.1f} at the selected frame "
@@ -760,6 +865,60 @@ elif opt_plt == "stiffness_map":
                       f"(|phi|max = {pm[first_ok]:.1f}, t = {t_arr[first_ok]:.0f}). **")
             else:
                 print( "  ** No frame in this dump is healthy — use an earlier folder. **")
+    # max Te and the per-leg Ne/Te minima per frame — the other two numbers of
+    # the run-health metrics (|phi|max, min Ne per leg, LE vs NL fails). A leg
+    # draining toward ~3e14 m^-3 has lost its sheath sink, which is the CD
+    # density/power runaway; a leg Te pinned at the eV level with Ne still
+    # falling is the same story one step earlier. The legs are reported
+    # SEPARATELY because in a double null the four of them are physically
+    # disconnected (see same_seg) — a single lumped minimum hides which one is
+    # emptying. x-guards and the y-boundary guard rows are excluded via `dom`,
+    # so no extrapolated garbage enters a minimum.
+    #
+    # No restart de-duplication is needed here: this reads ONE folder's dump,
+    # whose frame 0 is the `dump_at_restart` copy of the previous folder's last
+    # frame — the start of this trajectory, not a duplicate within it. Across
+    # folders use inventory_time, which takes each folder's last frame only.
+    Nn = float(np.array(ds["Nnorm"][...])) if "Nnorm" in ds.variables else 1.0
+    Tn = float(np.array(ds["Tnorm"][...])) if "Tnorm" in ds.variables else 1.0
+    LEG_REGIONS = ("inner-lower leg", "upper-inner leg",
+                   "upper-outer leg", "outer-lower leg")
+    leg_y = {rg: [y for y in range(nyf) if ym[y] and region_of(y) == rg]
+             for rg in LEG_REGIONS}
+    leg_y = {rg: ys for rg, ys in leg_y.items() if ys}
+    xin, xout = MXG, nxf - MXG
+
+    if "Te" in ds.variables and "Ne" in ds.variables:
+        hdr = (f"  {'frame':>5} {'t':>10} {'maxTe[eV]':>10} {'minTe_leg':>10} "
+               f"{'minNe_leg':>12}  emptiest leg")
+        print(hdr)
+        for k in range(nt):
+            Te = np.array(ds["Te"][k]) * Tn
+            Ne = np.array(ds["Ne"][k]) * Nn
+            mx = float(np.nanmax(np.where(dom, Te, np.nan)))
+            if leg_y:
+                mnT = min(float(np.nanmin(Te[xin:xout][:, ys]))
+                          for ys in leg_y.values())
+                mnN = min(float(np.nanmin(Ne[xin:xout][:, ys]))
+                          for ys in leg_y.values())
+                worst = min(leg_y, key=lambda rg:
+                            float(np.nanmin(Ne[xin:xout][:, leg_y[rg]])))
+            else:
+                mnT = mnN = float("nan")
+                worst = "(no legs in this topology)"
+            star = "*" if k == (FRAME % nt) else " "
+            print(f"  {k:>5}{star}{t_arr[k]:>9.1f} {mx:>10.1f} {mnT:>10.4f} "
+                  f"{mnN:>12.3e}  {worst}")
+        if leg_y:
+            Te = np.array(ds["Te"][FRAME]) * Tn
+            Ne = np.array(ds["Ne"][FRAME]) * Nn
+            print(f"  per-leg minima at frame {FRAME % nt}:")
+            for rg, ys in leg_y.items():
+                print(f"    {rg:<17} Ne {float(np.nanmin(Ne[xin:xout][:, ys])):.3e}"
+                      f"   Te {float(np.nanmin(Te[xin:xout][:, ys])):8.4f} eV"
+                      f"   ({len(ys)} rows)")
+    else:
+        print("  Te/Ne not saved in this dump — skipping max Te and the leg minima.")
     print()
 
     # --- weight per variable -------------------------------------------------

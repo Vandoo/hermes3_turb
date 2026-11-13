@@ -1,70 +1,21 @@
 #!/usr/bin/env python
-"""
-PER-FRAME radial heat flux at one flux surface, as a time series — and its
-autocorrelation, to measure the SLOW-MODE time `tau_slow`.
+"""Compute a radial energy-flux time series and its autocorrelation.
 
-Why this exists
----------------
-`v3_radial_conservation.py` reports a time-AVERAGED `F_out(x)`.  Its error bar
-is usually quoted from the within-window scatter, which is the *fast* turbulent
-fluctuation (`tau_c ~ 2-3 us` on this case).  That is the wrong error bar if the
-series also drifts on a slower timescale: separate windows of the SAME run then
-disagree by far more than their own standard errors, which is exactly what
-happens here —
+Each retained snapshot is integrated over a selected flux surface using
+radial_flux_profile and the ExB energy coefficient from fluxes.py. Data is
+loaded in BOUT-normalised units, y-guards are removed, and restart overlaps
+are deduplicated by time. Frames are processed individually to limit memory.
 
-    396      (11 frames)   425.5 kW
-    609-614  (60 frames)   629.9
-    403-408  ( 8 frames)   880.5     -> 1-sigma spread 228 kW
+Outputs include F(t), its mean and standard deviation, the autocorrelation,
+the integral correlation time truncated at the first zero crossing, and
+N_eff = span/(2*tau_int). The estimated mean error uses sigma/sqrt(N_eff).
+The required spans for N_eff = 10, 20, and 50 are also reported.
 
-and the measured `tau_E = W/P_in = 18.5 us` means all three windows are many
-confinement times long, so the drift is NOT a `tau_E` transient.  This is the
-"Steady-state?" problem of flux-driven global simulations (P. Tamain, UKAEA
-Exhaust Codes Workshop 2026, slide 28: a SOLEDGE3X/TCV case swinging +75 % on
-the ms timescale; "global flux-driven simulations require long time to get to
-meaning-full steady-state").
+This calculates total ExB flux per frame. The ensemble mean/turbulent split
+uses averages over both toroidal angle and time and is provided separately
+by v3_radial_conservation.py.
 
-The number that decides how long a window must be is `tau_slow`, and that can
-be measured from frames already on disk rather than guessed:
-
-    span needed  ~  N_eff * tau_slow        (N_eff ~ 10 for a ~10 % error, since
-                                             the error on the mean goes as
-                                             1/sqrt(N_eff) with N_eff the number
-                                             of INDEPENDENT slow samples)
-
-What it computes
-----------------
-For each retained frame, the ExB radial heat flux integrated over one flux
-surface (default `x = ixseps1`), with the same conventions as
-`v3_radial_conservation.py`: `unnormalise=False` so the metric stays
-self-consistent, y-guard rows dropped, restart duplicates removed by time
-VALUE, closed theta-band, and `radial_flux_profile` for the surface integral
-(so the numbers are directly comparable).  Then:
-
-  * the series `F(t)` and its mean / fast-sigma / naive SEM
-  * the autocorrelation `rho(lag)`
-  * the integral time `tau_int = dt * (0.5 + sum rho)` truncated at the first
-    zero crossing  -- NOT the 1/e crossing, which is a different and usually
-    shorter number (getting those two confused once turned 19 independent
-    samples into 12)
-  * `N_eff = span / (2 tau_int)` and the honest error bar `sigma/sqrt(N_eff)`
-  * the span required for N_eff = 10, 20, 50
-
-ONE frame is held in memory at a time: the full (244, 120, 81) fields for 60
-frames do not fit comfortably, and streaming is what made the long-window runs
-possible at all.
-
-TOTAL flux only, deliberately
------------------------------
-The per-frame quantity is the total `q = (5/2) <P v_r>_zeta`, which is
-unambiguous.  The mean/turbulent SPLIT is deliberately not done per frame:
-`hermes3_turb`'s convention takes the ensemble average over zeta AND t INSIDE
-the product, and decomposing per snapshot then averaging drops the temporal
-correlation of the zonal/mean flow (see fluxes.py).  Use the split that
-`v3_radial_conservation.py` now prints for that question.
-
-Usage
------
-Edit CONFIG and run from the case's `data/` directory, as with the v3_* scripts.
+Edit CONFIG and run from the case's data directory.
 """
 
 import sys

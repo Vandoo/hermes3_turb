@@ -158,10 +158,8 @@ def load_grid_vars(gridfile, ds=None, pdim="theta", normalise=None):
 
     The flux/drift formulas in :mod:`hermes3_turb.fluxes` combine these with
     metric components ``g_ij``, ``J`` taken from the dataset, so the two must
-    be in the same normalisation. Reading bxcvy raw from the grid (physical
-    m⁻²) and combining it with normalised metric over-counts the poloidal
-    magnetic-drift by 1/rho_s0² ≈ 10⁶ for rho_s0 ~ mm — the cause of an early
-    bug in this package, see [[bug-poloidal-magdrift]].
+    be in the same normalisation. Grid curvature and dataset metrics must use the same units; raw SI
+    bxcvy is incompatible with normalised metric components.
 
     Parameters
     ----------
@@ -487,34 +485,15 @@ def get_parallel_velocity(ds, species, AA=None):
 
 
 def dedup_restart_times(ds, rtol=1e-3, verbose=True):
-    """Drop repeated / out-of-order output times after concatenating folders.
+    """Remove repeated and out-of-order output times after concatenating folders.
 
-    **Use this instead of dropping each folder's first frame.** The positional
-    rule assumes the first output of a restarted run duplicates the last
-    output of the previous one, which is only true for BOUT++'s default
-    ``dump_at_restart = true``. With ``dump_at_restart = false`` the first
-    frame is a **genuinely new time**, so the positional drop silently deletes
-    real data — and a folder squashed to a *single* output time then
-    contributes nothing at all, so N such folders collapse to one frame.
-    Measured on ``sxd_MU/from_archer_6kW``: folders 404/405/407/408 hold one
-    frame each and vanished entirely, while 403/404 really do share
-    ``t = 726111.1``. Comparing time *values* handles both conventions with
-    no knowledge of the flag, and mixed settings across one ``dir_range`` as
-    well.
+    Time values are compared with a running maximum. This supports both values
+    of dump_at_restart, overlapping folders, and single-frame outputs without
+    discarding a new first frame by position.
 
-    The comparison is a **running max**, not against the previous frame only:
-    a folder that starts before the previous one ends would otherwise leave a
-    non-monotonic series and a negative ``dt``.
-
-    ``rtol`` guards float noise. A restart time that differs in the last bits
-    (``726111.1`` vs ``726111.100001``) is not caught by a strict ``>`` and
-    leaves a near-zero ``dt`` — which is the 0.1 µs trap that once made
-    parallel flows look steady to 0.5 % when the real frame spacing was
-    104 µs. A frame is kept only if it is later than the running max by more
-    than ``rtol`` of the median positive step. Any surviving step below
-    ``rtol`` of the median is reported.
-
-    Returns the dataset with the offending time points removed.
+    A frame must exceed the running maximum by more than rtol times the median
+    positive step. This rejects floating-point duplicates that would otherwise
+    produce near-zero intervals. Remaining unusually short steps are reported.
     """
     import numpy as np
 

@@ -1,17 +1,17 @@
 """Synthetic-blob regression test for the three velocity estimators.
 
-The point of this file: the blob module had no ground truth. Every estimator
-was checked against the *other* estimators on real data, where all three can
-be wrong together. Here Gaussian filaments are advected at a velocity that is
-known exactly, sampled on a grid and cadence matching the MAST-U SXD OMP
-slice, and each estimator is asked to recover it.
+The point of this file is ground truth. Checking an estimator against the
+*other* estimators on real data cannot separate three that are wrong
+together, so here Gaussian filaments are advected at a velocity known
+exactly, sampled on a grid and cadence matching the MAST-U SXD OMP slice, and
+each estimator is asked to recover it.
 
-This is what exposed the matched-z cross-correlation bug: with ``v_b = 0``
-the 1-D CCF was fine, but switching on a realistic binormal drift (which is
-10-100x the radial one in a real SOL) made it return 113 m/s against a true
-400 m/s *while reporting ``resolved=True``* — a silent 3.5x under-estimate in
-exactly the direction of the "simulated blobs are too slow" puzzle. Keep the
-``v_b != 0`` cases.
+``v_b != 0`` IS THE LOAD-BEARING PART — keep those cases. A matched-z 1-D CCF
+agrees with the truth at ``v_b = 0`` and fails only once a realistic binormal
+drift is present (10-100x the radial one in a real SOL): it then returns
+113 m/s against a true 400 m/s *while reporting* ``resolved=True``. A 3.5x
+under-estimate with no warning, in exactly the direction of the "simulated
+blobs are too slow" puzzle, is invisible to any ``v_b = 0`` test.
 
 Run with ``pytest hermes3_turb/tests/`` (or as a script).
 """
@@ -88,7 +88,7 @@ def test_estimators_recover_known_velocity(v_b):
 
 
 def test_matched_z_ccf_is_biased_low_when_blobs_drift():
-    """The bug this file exists for. Keep it as documentation."""
+    """Why the 2-D (dt, dz) scan is required. Keep as documentation."""
     v_r, v_b, dt = 400.0, 6000.0, 5.0e-6
     t, n = make_blobs(v_r, v_b, dt, dw_r=1e-3)
     f, _, _ = h3t.fluctuation_field(n, normalise="sigma")
